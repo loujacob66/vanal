@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+data/
+frames/
+*.db
+venv/
+.claude/
+sora_downloads/
+outputs/
