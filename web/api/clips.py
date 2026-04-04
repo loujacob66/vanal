@@ -1,13 +1,18 @@
 import json
 import os
+import threading
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from vanal import db
+from vanal.ingest import VIDEO_EXTENSIONS
 from web.api.auth import require_auth
+
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500"))
 
 router = APIRouter()
 
@@ -75,19 +80,52 @@ def ingest_status(_auth=Depends(require_auth)):
     }
 
 
+@router.get("/clips/owners")
+def list_owners(_auth=Depends(require_auth)):
+    """Return list of users who own clips (admin only, used for owner filter)."""
+    if not _auth["is_admin"]:
+        return []
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT u.id, u.name, u.email, COUNT(c.id) AS clip_count
+               FROM users u
+               JOIN clips c ON c.owner_id = u.id
+               GROUP BY u.id
+               ORDER BY u.name""",
+        ).fetchall()
+    return [
+        {"id": r["id"], "name": r["name"], "email_prefix": r["email"].split("@")[0], "clip_count": r["clip_count"]}
+        for r in rows
+    ]
+
+
 @router.get("/clips")
 def list_clips(
     search: str | None = Query(None),
     tag: str | None = Query(None),
     sort: str = Query("filename"),
+    owner: str | None = Query(None),
     _auth=Depends(require_auth),
 ):
-    """List clips owned by the current user (admin sees all)."""
-    owner_frag, owner_params = _owner_where(_auth)
+    """List clips owned by the current user (admin sees all).
+    Admin can filter by owner email prefix via ?owner=name.
+    """
+    # Use table-aliased owner filter for the JOIN queries below
+    if _auth["is_admin"] and owner:
+        owner_frag = " AND u.email LIKE ?"
+        owner_params = [f"{owner}@%"]
+    elif _auth["is_admin"]:
+        owner_frag, owner_params = "", []
+    else:
+        owner_frag = " AND c.owner_id = ?"
+        owner_params = [_auth["id"]]
+
     with db.get_conn() as conn:
         if search:
             rows = conn.execute(
-                f"""SELECT c.* FROM clips c
+                f"""SELECT c.*, u.name AS owner_name, u.email AS owner_email
+                   FROM clips c
+                   LEFT JOIN users u ON c.owner_id = u.id
                    JOIN clips_fts f ON c.id = f.rowid
                    WHERE clips_fts MATCH ? {owner_frag}
                    ORDER BY CASE WHEN ? = 'position' THEN c.position ELSE NULL END,
@@ -96,16 +134,21 @@ def list_clips(
             ).fetchall()
         elif tag:
             rows = conn.execute(
-                f"""SELECT * FROM clips
-                   WHERE ',' || tags || ',' LIKE ? {owner_frag}
-                   ORDER BY CASE WHEN ? = 'position' THEN position ELSE NULL END,
-                           filename""",
+                f"""SELECT c.*, u.name AS owner_name, u.email AS owner_email
+                   FROM clips c
+                   LEFT JOIN users u ON c.owner_id = u.id
+                   WHERE ',' || c.tags || ',' LIKE ? {owner_frag}
+                   ORDER BY CASE WHEN ? = 'position' THEN c.position ELSE NULL END,
+                           c.filename""",
                 [f"%,{tag},%"] + owner_params + [sort],
             ).fetchall()
         else:
-            order = "position, filename" if sort == "position" else "filename"
+            order = "c.position, c.filename" if sort == "position" else "c.filename"
             rows = conn.execute(
-                f"SELECT * FROM clips WHERE 1=1 {owner_frag} ORDER BY {order}",
+                f"""SELECT c.*, u.name AS owner_name, u.email AS owner_email
+                   FROM clips c
+                   LEFT JOIN users u ON c.owner_id = u.id
+                   WHERE 1=1 {owner_frag} ORDER BY {order}""",
                 owner_params,
             ).fetchall()
 
@@ -421,6 +464,179 @@ def reorder_clips(request: ReorderRequest, _auth=Depends(require_auth)):
                 (item.position, item.id),
             )
     return {"ok": True, "updated": len(request.items)}
+
+
+# ── Delete ─────────────────────────────────────────────────────────
+@router.delete("/clips/{clip_id}")
+def delete_clip(clip_id: int, _auth=Depends(require_auth)):
+    """Delete a clip, its video file, and extracted frames. Owners can delete their own clips; admins can delete any."""
+    import shutil
+
+    with db.get_conn() as conn:
+        clip = get_user_clip(conn, clip_id, _auth, columns="id, filename, filepath, file_hash, owner_id, status")
+
+        # Don't allow deleting a clip that's currently processing
+        if clip["status"] == "processing":
+            raise HTTPException(status_code=409, detail="Cannot delete a clip that is currently processing")
+
+        # Delete from DB
+        conn.execute("DELETE FROM clips_fts WHERE rowid = ?", (clip_id,))
+        conn.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
+
+    # Clean up video file
+    video_path = Path(clip["filepath"])
+    if video_path.exists():
+        video_path.unlink(missing_ok=True)
+
+    # Clean up extracted frames
+    if clip["file_hash"]:
+        frames_dir = Path(os.getenv("FRAMES_DIR", "frames")) / clip["file_hash"]
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir, ignore_errors=True)
+
+    return {"ok": True, "filename": clip["filename"]}
+
+
+# ── Upload ─────────────────────────────────────────────────────────
+@router.post("/clips/upload")
+async def upload_clip(file: UploadFile = File(...), _auth=Depends(require_auth)):
+    """Upload a video file, save to per-user dir, and kick off background processing."""
+    # Validate extension
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
+
+    # Read file and check size
+    contents = await file.read()
+    size_mb = len(contents) / 1_048_576
+    if size_mb > MAX_UPLOAD_SIZE_MB:
+        raise HTTPException(status_code=400, detail=f"File too large ({size_mb:.0f} MB, max {MAX_UPLOAD_SIZE_MB} MB)")
+
+    # Save to per-user upload directory (named by email prefix)
+    email_prefix = _auth["email"].split("@")[0].replace("/", "_").replace("\\", "_")
+    user_dir = UPLOAD_DIR / email_prefix
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    # Handle duplicate filenames
+    safe_name = file.filename or "upload.mp4"
+    dest = user_dir / safe_name
+    counter = 1
+    while dest.exists():
+        stem = Path(safe_name).stem
+        dest = user_dir / f"{stem}_{counter}{ext}"
+        counter += 1
+
+    dest.write_bytes(contents)
+
+    # Create pending DB row immediately so it shows in the queue
+    from vanal.ingest import sha256_file, _upsert_pending
+    file_hash = sha256_file(dest)
+    with db.get_conn() as conn:
+        _upsert_pending(conn, dest.name, str(dest.resolve()), file_hash, owner_id=_auth["id"])
+
+    # Kick the background worker to pick it up
+    _kick_processing_worker()
+
+    return {"ok": True, "filename": dest.name, "size_mb": round(size_mb, 1)}
+
+
+# ── Background processing worker ─────────────────────────────────
+_worker_lock = threading.Lock()
+_worker_running = False
+
+
+def _kick_processing_worker():
+    """Ensure the background worker is running. Only one runs at a time."""
+    global _worker_running
+    with _worker_lock:
+        if _worker_running:
+            return  # already processing the queue
+        _worker_running = True
+
+    def worker():
+        global _worker_running
+        from vanal.ingest import process_file
+        try:
+            while True:
+                # Pick next pending clip
+                with db.get_conn() as conn:
+                    row = conn.execute(
+                        "SELECT id, filepath FROM clips WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+                    ).fetchone()
+                if not row:
+                    break  # queue empty
+                process_file(Path(row["filepath"]), delay_secs=0)
+        finally:
+            with _worker_lock:
+                _worker_running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ── Processing queue ───────────────────────────────────────────────
+@router.get("/processing/queue")
+def processing_queue(_auth=Depends(require_auth)):
+    """Return processing queue info.
+
+    Admin sees ALL queued clips with full details.
+    Regular users see their own clips with details + count of others ahead.
+    """
+    with db.get_conn() as conn:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        if _auth["is_admin"]:
+            # Admin sees everything with full details
+            all_rows = conn.execute(
+                """SELECT c.id, c.filename, c.status, c.processing_stage,
+                          c.created_at, c.updated_at,
+                          c.owner_id, u.name AS owner_name, u.email AS owner_email
+                   FROM clips c
+                   LEFT JOIN users u ON c.owner_id = u.id
+                   WHERE c.status IN ('pending', 'processing')
+                   ORDER BY CASE c.status WHEN 'processing' THEN 0 ELSE 1 END, c.updated_at ASC""",
+            ).fetchall()
+            return {
+                "own": [dict(r) for r in all_rows],
+                "others_ahead": 0,
+                "server_time": now,
+            }
+        else:
+            # Own clips — full details
+            own_rows = conn.execute(
+                """SELECT id, filename, status, processing_stage, created_at, updated_at
+                   FROM clips
+                   WHERE status IN ('pending', 'processing') AND owner_id = ?
+                   ORDER BY CASE status WHEN 'processing' THEN 0 ELSE 1 END, updated_at ASC""",
+                (_auth["id"],),
+            ).fetchall()
+
+            # Count of other users' clips that are ahead (processing or queued before user's earliest)
+            own_earliest = None
+            if own_rows:
+                own_earliest = own_rows[0]["updated_at"]
+
+            if own_earliest:
+                # Items ahead = other users' clips that started before or are currently processing
+                others_ahead = conn.execute(
+                    """SELECT COUNT(*) FROM clips
+                       WHERE status IN ('pending', 'processing')
+                         AND owner_id != ?
+                         AND (status = 'processing' OR updated_at <= ?)""",
+                    (_auth["id"], own_earliest),
+                ).fetchone()[0]
+            else:
+                # User has nothing queued — show total backlog so they know wait time
+                others_ahead = conn.execute(
+                    "SELECT COUNT(*) FROM clips WHERE status IN ('pending', 'processing') AND owner_id != ?",
+                    (_auth["id"],),
+                ).fetchone()[0]
+
+            return {
+                "own": [dict(r) for r in own_rows],
+                "others_ahead": others_ahead,
+                "server_time": now,
+            }
 
 
 def _row_to_dict(row) -> dict:

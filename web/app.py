@@ -37,3 +37,11 @@ app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 @app.on_event("startup")
 def startup():
     db.migrate()
+
+    # Reset any clips stuck as 'processing' from a previous crash/restart
+    with db.get_conn() as conn:
+        conn.execute("UPDATE clips SET status = 'pending', processing_stage = NULL WHERE status = 'processing'")
+
+    # Kick the worker to process any pending clips left in the queue
+    from web.api.clips import _kick_processing_worker
+    _kick_processing_worker()

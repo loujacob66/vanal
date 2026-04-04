@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from vanal import db
 from vanal.ingest import VIDEO_EXTENSIONS, ingest_directory, OUTPUT_DIR
-from web.api.auth import require_auth
+from web.api.auth import require_admin, require_auth
 from web.api.clips import _owner_where
 
 router = APIRouter()
@@ -30,7 +30,7 @@ class StartIngestRequest(BaseModel):
 
 
 @router.get("/fs/browse")
-def fs_browse(path: str = "", _auth=Depends(require_auth)):
+def fs_browse(path: str = "", _auth=Depends(require_admin)):
     """List subdirectories at the given server path for the folder picker."""
     if not path:
         browse = Path.home()
@@ -53,7 +53,7 @@ def fs_browse(path: str = "", _auth=Depends(require_auth)):
 
 
 @router.post("/ingest/list-videos")
-def list_videos(req: ListVideosRequest, _auth=Depends(require_auth)):
+def list_videos(req: ListVideosRequest, _auth=Depends(require_admin)):
     directory = Path(req.directory)
     if not directory.exists():
         raise HTTPException(status_code=400, detail=f"Directory not found: {req.directory}")
@@ -72,7 +72,7 @@ def list_videos(req: ListVideosRequest, _auth=Depends(require_auth)):
 
 
 @router.post("/ingest/start")
-def start_ingest(req: StartIngestRequest, _auth=Depends(require_auth)):
+def start_ingest(req: StartIngestRequest, _auth=Depends(require_admin)):
     global _ingest_thread
 
     with _ingest_lock:
@@ -123,7 +123,7 @@ class FramesRequest(BaseModel):
 
 
 @router.get("/ingest/missing-frames")
-def missing_frames_info(_auth=Depends(require_auth)):
+def missing_frames_info(_auth=Depends(require_admin)):
     """Return counts of clips missing frames and current extraction progress."""
     missing = _get_missing_frames_clips(_auth)
     total_done = len(_get_all_done_clips(_auth))
@@ -131,7 +131,7 @@ def missing_frames_info(_auth=Depends(require_auth)):
 
 
 @router.post("/ingest/extract-missing-frames")
-def extract_missing_frames(req: FramesRequest = FramesRequest(), _auth=Depends(require_auth)):
+def extract_missing_frames(req: FramesRequest = FramesRequest(), _auth=Depends(require_admin)):
     """Background-extract frames. force=True re-extracts all done clips."""
     global _frames_thread, _frames_progress
     import shutil

@@ -71,17 +71,21 @@ def _describe_single_frame(frame_path: Path, index: int, total: int, filename: s
     return f"(failed to describe frame {index + 1}: {last_error})"
 
 
-def describe_frames(frame_paths: list[Path], filename: str, transcript: str | None = None) -> dict:
+def describe_frames(frame_paths: list[Path], filename: str, transcript: str | None = None, on_progress=None) -> dict:
     """
     Describe each frame individually, then synthesize a synopsis and generate tags.
     If a transcript is provided it is included in the synopsis prompt.
     Returns {"frames": ["desc1", ...], "synopsis": "...", "tags": ["tag1", ...]}
+    on_progress(step, current, total) is called after each frame and during synopsis/tag steps.
     """
     # Step 1: Describe each frame one at a time (much faster on CPU)
+    total = len(frame_paths)
     frame_descriptions = []
     for i, frame_path in enumerate(frame_paths):
-        print(f"    Frame {i + 1}/{len(frame_paths)}...", end=" ", flush=True)
-        desc = _describe_single_frame(frame_path, i, len(frame_paths), filename)
+        if on_progress:
+            on_progress("frames", i + 1, total)
+        print(f"    Frame {i + 1}/{total}...", end=" ", flush=True)
+        desc = _describe_single_frame(frame_path, i, total, filename)
         frame_descriptions.append(desc)
         print(f"OK")
 
@@ -105,6 +109,8 @@ def describe_frames(frame_paths: list[Path], filename: str, transcript: str | No
         "and key message. Respond with ONLY the synopsis text, nothing else."
     )
 
+    if on_progress:
+        on_progress("synopsis", 0, 0)
     synopsis = ""
     for attempt in range(MAX_RETRIES):
         try:
@@ -119,6 +125,8 @@ def describe_frames(frame_paths: list[Path], filename: str, transcript: str | No
         synopsis = " ".join(frame_descriptions)
 
     # Step 3: Generate content tags
+    if on_progress:
+        on_progress("tagging", 0, 0)
     tags = generate_tags(frame_descriptions, synopsis, transcript, filename)
 
     return {"frames": frame_descriptions, "synopsis": synopsis, "tags": tags}

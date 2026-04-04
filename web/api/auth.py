@@ -20,7 +20,7 @@ oauth.register(
     client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
     client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "openid email profile"},
+    client_kwargs={"scope": "openid email profile", "prompt": "select_account"},
 )
 
 
@@ -38,6 +38,14 @@ def require_auth(session_token: str | None = Cookie(default=None)):
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
     return dict(row)
+
+
+def require_admin(session_token: str | None = Cookie(default=None)):
+    """Like require_auth but also enforces is_admin=1."""
+    user = require_auth(session_token)
+    if not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
 
 
 # ── Routes ─────────────────────────────────────────────────────────

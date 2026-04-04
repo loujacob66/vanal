@@ -11,13 +11,17 @@ let pendingQueueSuggestion = null; // AI-suggested order for queue, waiting for 
 let showQueuedOnly = false;   // filter grid to queued clips only
 let isAuthenticated = false;  // set after /api/auth/status check
 let currentUser = null;       // user dict from /api/auth/status
+let activeOwner = "";         // email prefix filter (admin only)
 
 // ─── Init ─────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", async () => {
     await initAuth();
     if (!isAuthenticated) return;  // show login screen, don't load anything
     loadClips();
-    pollIngestStatus();
+    if (currentUser && currentUser.is_admin) { pollIngestStatus(); initOwnerFilter(); }
+    pollProcessingQueue();
+    initUpload();
+    initTagFilter();
     initDrawer();
     initQueuePanel();
     initBottomNav();
@@ -82,7 +86,9 @@ async function loadClips() {
     const loading = document.getElementById("loading");
     loading.style.display = "block";
     try {
-        const resp = await fetch("/api/clips");
+        const params = new URLSearchParams();
+        if (activeOwner) params.set("owner", activeOwner);
+        const resp = await fetch("/api/clips" + (params.toString() ? "?" + params : ""));
         allClips = await resp.json();
         renderClips(allClips);
         renderTags();
@@ -141,7 +147,8 @@ function renderClips(clips) {
 }
 
 function clipCardHTML(c) {
-    const dur     = c.duration ? formatDuration(c.duration) : "?";
+    const isProcessing = c.status === "processing" || c.status === "pending";
+    const dur     = c.duration ? formatDuration(c.duration) : (isProcessing ? "" : "?");
     const res     = c.width && c.height ? `${c.width}×${c.height}` : "";
     const posHTML = c.position != null ? `<span class="clip-position">${c.position}</span>` : "";
     const tagsHTML = (c.tags || "").split(",").filter(Boolean)
@@ -180,6 +187,7 @@ function clipCardHTML(c) {
                     <span>${dur}</span>
                     ${res ? `<span>${res}</span>` : ""}
                     <span class="clip-status ${c.status}">${c.status}</span>
+                    ${(currentUser && currentUser.is_admin && c.owner_name) ? `<span class="clip-owner">${esc(c.owner_name)}</span>` : ""}
                 </div>
                 <div class="clip-synopsis">${esc(c.synopsis || "—")}</div>
                 ${tagsHTML ? `<div class="clip-tags">${tagsHTML}</div>` : ""}
@@ -188,24 +196,44 @@ function clipCardHTML(c) {
         </div>`;
 }
 
-function renderTags() {
+let _allTags = [];  // cached sorted tag list
+
+function renderTags(filterText) {
     const tagSet = new Set();
     allClips.forEach(c => (c.tags || "").split(",").filter(Boolean).forEach(t => tagSet.add(t.trim())));
+    _allTags = [...tagSet].sort();
+
     const container = document.getElementById("tag-list");
-    if (tagSet.size === 0) {
-        container.innerHTML = '<span style="color:var(--text2);font-size:0.8rem">No tags yet</span>';
+    if (_allTags.length === 0) {
+        container.innerHTML = '<span style="color:var(--text2);font-size:0.78rem">No tags yet</span>';
         return;
     }
-    container.innerHTML = [...tagSet].sort().map(t =>
+
+    const filter = (filterText || "").toLowerCase();
+    const visible = filter ? _allTags.filter(t => t.toLowerCase().includes(filter)) : _allTags;
+
+    if (visible.length === 0) {
+        container.innerHTML = '<span style="color:var(--text2);font-size:0.78rem">No matching tags</span>';
+        return;
+    }
+
+    container.innerHTML = visible.map(t =>
         `<span class="tag-pill${activeTag === t ? " active" : ""}" data-tag="${esc(t)}">${esc(t)}</span>`
     ).join("");
     container.querySelectorAll(".tag-pill").forEach(pill => {
         pill.addEventListener("click", () => {
             activeTag = activeTag === pill.dataset.tag ? null : pill.dataset.tag;
             filterAndRender();
-            renderTags();
+            renderTags(document.getElementById("tag-filter").value);
         });
     });
+}
+
+function initTagFilter() {
+    const input = document.getElementById("tag-filter");
+    input.addEventListener("input", debounce(() => {
+        renderTags(input.value);
+    }, 150));
 }
 
 function renderStats() {
@@ -213,7 +241,7 @@ function renderStats() {
     allClips.forEach(c => { stats[c.status] = (stats[c.status] || 0) + 1; });
     document.getElementById("stats").innerHTML = Object.entries(stats)
         .filter(([, v]) => v > 0)
-        .map(([k, v]) => `<div style="font-size:0.83rem"><span class="clip-status ${k}">${k}</span> ${v}</div>`)
+        .map(([k, v]) => `<span class="clip-status ${k}" style="font-size:0.7rem">${k} ${v}</span>`)
         .join("");
 }
 
@@ -940,6 +968,8 @@ function openModal(clipId) {
             <button class="btn btn-primary" id="modal-save">Save</button>
             <button class="btn" id="modal-share" title="Copy shareable link for this clip">🔗 Share</button>
             <span id="modal-saved" style="color:var(--green);font-size:0.85rem;display:none">Saved</span>
+            <span style="flex:1"></span>
+            <button class="btn btn-delete-clip" id="modal-delete" title="Delete this clip and its video file">Delete</button>
         </div>
     `;
 
@@ -950,6 +980,36 @@ function openModal(clipId) {
             const orig = btn.textContent;
             btn.textContent = "✓ Copied!";
             setTimeout(() => { btn.textContent = orig; }, 2000);
+        });
+    });
+
+    document.getElementById("modal-delete").addEventListener("click", () => {
+        requireAuth(async () => {
+            if (!confirm(`Delete "${clip.filename}"?\n\nThis will permanently remove the video file and all extracted data.`)) return;
+            const btn = document.getElementById("modal-delete");
+            btn.disabled = true;
+            btn.textContent = "Deleting...";
+            try {
+                const resp = await fetch(`/api/clips/${clipId}`, { method: "DELETE" });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    alert(data.detail || "Delete failed");
+                    btn.disabled = false;
+                    btn.textContent = "Delete";
+                    return;
+                }
+                showToast(`${clip.filename} deleted`, "success");
+                closeModal();
+                // Remove from local state and re-render
+                allClips = allClips.filter(c => c.id !== clipId);
+                queue = queue.filter(id => id !== clipId);
+                filterAndRender();
+                renderTags();
+            } catch (err) {
+                alert("Delete failed: " + err.message);
+                btn.disabled = false;
+                btn.textContent = "Delete";
+            }
         });
     });
 
@@ -1228,12 +1288,10 @@ function applyAuthState() {
         return;
     }
 
-    const logoutBtn = document.getElementById("btn-logout");
-    if (logoutBtn) logoutBtn.style.display = "block";
-
-    const userInfo = document.getElementById("user-info");
-    if (userInfo && currentUser) {
-        userInfo.style.display = "block";
+    // User footer in sidebar
+    const footer = document.getElementById("sidebar-user-footer");
+    if (footer && currentUser) {
+        footer.style.display = "flex";
         document.getElementById("user-name").textContent = currentUser.name || currentUser.email;
         const avatar = document.getElementById("user-avatar");
         if (currentUser.picture_url) {
@@ -1241,6 +1299,10 @@ function applyAuthState() {
             avatar.style.display = "inline-block";
         }
     }
+
+    // Admin-only UI
+    const ingestBtn = document.getElementById("btn-ingest");
+    if (ingestBtn) ingestBtn.style.display = currentUser?.is_admin ? "block" : "none";
 }
 
 function showLoginModal(_onSuccess) {
@@ -1520,7 +1582,239 @@ function showIngestError(msg) {
     el.style.display = "block";
 }
 
+// ─── Owner Filter (admin only) ────────────────────────────────────
+async function initOwnerFilter() {
+    const select = document.getElementById("owner-select");
+    try {
+        const resp = await fetch("/api/clips/owners");
+        const owners = await resp.json();
+        if (owners.length < 2) return;  // no point filtering with 1 user
+
+        select.style.display = "block";
+        for (const o of owners) {
+            const opt = document.createElement("option");
+            opt.value = o.email_prefix;
+            opt.textContent = `${o.name || o.email_prefix} (${o.clip_count})`;
+            select.appendChild(opt);
+        }
+
+        select.addEventListener("change", () => {
+            activeOwner = select.value;
+            loadClips();
+        });
+    } catch { /* ignore */ }
+}
+
+// ─── Toast Notifications ──────────────────────────────────────────
+function initToasts() {
+    const c = document.createElement("div");
+    c.className = "toast-container";
+    c.id = "toast-container";
+    document.body.appendChild(c);
+}
+
+function showToast(message, type = "info") {
+    const container = document.getElementById("toast-container");
+    if (!container) return;
+    const el = document.createElement("div");
+    el.className = `toast toast-${type}`;
+    el.textContent = message;
+    container.appendChild(el);
+    setTimeout(() => el.remove(), 4000);
+}
+
+// ─── Upload ───────────────────────────────────────────────────────
+function initUpload() {
+    initToasts();
+    const btn = document.getElementById("btn-upload");
+    const input = document.getElementById("upload-input");
+    btn.addEventListener("click", () => requireAuth(() => input.click()));
+    input.addEventListener("change", onUploadFiles);
+}
+
+function uploadOneFile(file, label) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const statusEl = document.getElementById("upload-status");
+        const statusText = document.getElementById("upload-status-text");
+        const progressBar = document.getElementById("upload-progress-bar");
+
+        statusEl.style.display = "flex";
+        statusText.textContent = label;
+        progressBar.style.width = "0%";
+
+        xhr.upload.addEventListener("progress", (e) => {
+            if (e.lengthComputable) {
+                const pct = Math.round((e.loaded / e.total) * 100);
+                progressBar.style.width = pct + "%";
+                statusText.textContent = `${label} ${pct}%`;
+            }
+        });
+
+        xhr.addEventListener("load", () => {
+            try {
+                const data = JSON.parse(xhr.responseText);
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(data);
+                } else {
+                    reject(new Error(data.detail || `Upload failed (${xhr.status})`));
+                }
+            } catch {
+                reject(new Error(`Upload failed (${xhr.status})`));
+            }
+        });
+
+        xhr.addEventListener("error", () => reject(new Error("Network error")));
+        xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
+
+        const form = new FormData();
+        form.append("file", file);
+        xhr.open("POST", "/api/clips/upload");
+        xhr.send(form);
+    });
+}
+
+async function onUploadFiles(e) {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    e.target.value = "";  // reset so same file can be re-selected
+
+    const btn = document.getElementById("btn-upload");
+    const statusEl = document.getElementById("upload-status");
+    btn.disabled = true;
+
+    let succeeded = 0, failed = 0;
+
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const label = files.length > 1
+            ? `${file.name} (${i + 1}/${files.length})`
+            : file.name;
+
+        try {
+            await uploadOneFile(file, label);
+            succeeded++;
+            showToast(`${file.name} uploaded — processing started`, "success");
+            pollProcessingQueue();  // refresh queue immediately after each upload
+        } catch (err) {
+            failed++;
+            showToast(`${file.name}: ${err.message}`, "error");
+        }
+    }
+
+    // Hide progress bar after a brief delay
+    setTimeout(() => { statusEl.style.display = "none"; }, 1000);
+    btn.disabled = false;
+
+    if (succeeded > 0 && files.length > 1) {
+        showToast(`${succeeded} of ${files.length} files uploaded`, "info");
+    }
+}
+
+// ─── Processing Queue ─────────────────────────────────────────────
+let _procQueueTimer = null;
+let _prevQueueIds = new Set();
+
+async function pollProcessingQueue() {
+    if (_procQueueTimer) { clearTimeout(_procQueueTimer); _procQueueTimer = null; }
+    try {
+        const resp = await fetch("/api/processing/queue");
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const items = data.own || [];
+        const othersAhead = data.others_ahead || 0;
+        const serverTime = data.server_time ? new Date(data.server_time + "Z") : new Date();
+        const isAdmin = currentUser && currentUser.is_admin;
+
+        const container = document.getElementById("processing-queue");
+        const list = document.getElementById("processing-queue-list");
+        const label = document.getElementById("processing-queue-label");
+
+        // Detect clips that just finished (were in queue, now gone)
+        const currentIds = new Set(items.map(i => i.id));
+        for (const prevId of _prevQueueIds) {
+            if (!currentIds.has(prevId)) {
+                showToast("A clip finished processing", "success");
+                loadClips();  // refresh the clip list
+                break;  // one toast is enough
+            }
+        }
+        _prevQueueIds = currentIds;
+
+        const totalActive = items.length + othersAhead;
+        if (totalActive === 0) {
+            container.style.display = "none";
+            _procQueueTimer = setTimeout(pollProcessingQueue, 10000);
+            return;
+        }
+
+        container.style.display = "block";
+
+        // Build header label
+        const ownProcessing = items.filter(i => i.status === "processing").length;
+        const ownPending = items.filter(i => i.status === "pending").length;
+        let labelText = "Processing queue: ";
+        if (isAdmin) {
+            const parts = [];
+            const allProcessing = items.filter(i => i.status === "processing").length;
+            const allPending = items.length - allProcessing;
+            if (allProcessing > 0) parts.push(`${allProcessing} processing`);
+            if (allPending > 0) parts.push(`${allPending} queued`);
+            labelText += parts.join(", ");
+        } else {
+            const parts = [];
+            if (ownProcessing > 0) parts.push(`${ownProcessing} of yours processing`);
+            if (ownPending > 0) parts.push(`${ownPending} of yours waiting`);
+            labelText += parts.join(", ");
+        }
+        label.textContent = labelText;
+
+        // Build detail list
+        let html = "";
+
+        // For non-admin: show other users' backlog indicator first
+        if (!isAdmin && othersAhead > 0) {
+            html += `<div class="proc-item proc-others">${othersAhead} other user clip${othersAhead === 1 ? "" : "s"} also in queue</div>`;
+        }
+
+        for (const item of items) {
+            // Admin sees owner name for other people's clips
+            const ownerTag = (isAdmin && item.owner_name)
+                ? `<span class="proc-owner">${esc(item.owner_name)}</span>`
+                : "";
+
+            // Elapsed time: always from created_at (total time in queue/processing)
+            const elapsed = item.created_at ? formatElapsed(serverTime, new Date(item.created_at + "Z")) : "";
+            const elapsedTag = elapsed ? `<span class="proc-elapsed">${elapsed}</span>` : "";
+
+            if (item.status === "processing") {
+                const stage = item.processing_stage
+                    ? `<span class="proc-stage">${esc(item.processing_stage)}</span>`
+                    : `<span class="proc-stage">starting...</span>`;
+                html += `<div class="proc-item"><span class="proc-spinner"></span> ${esc(item.filename)} ${stage} ${elapsedTag} ${ownerTag}</div>`;
+            } else {
+                html += `<div class="proc-item"><span class="proc-pending"></span> ${esc(item.filename)} <span class="proc-stage">queued</span> ${elapsedTag} ${ownerTag}</div>`;
+            }
+        }
+        list.innerHTML = html;
+
+        _procQueueTimer = setTimeout(pollProcessingQueue, 3000);
+    } catch {
+        _procQueueTimer = setTimeout(pollProcessingQueue, 10000);
+    }
+}
+
 // ─── Utilities ────────────────────────────────────────────────────
+function formatElapsed(now, since) {
+    const secs = Math.max(0, Math.floor((now - since) / 1000));
+    if (secs < 60) return `${secs}s`;
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    if (m < 60) return `${m}m ${s}s`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m`;
+}
+
 function formatDuration(secs) {
     const m = Math.floor(secs / 60);
     const s = Math.floor(secs % 60);

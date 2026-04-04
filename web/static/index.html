@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>vanal</title>
-    <link rel="stylesheet" href="/style.css?v=12">
+    <link rel="stylesheet" href="/style.css?v=13">
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js"></script>
 </head>
 <body>
@@ -32,6 +32,8 @@
         </div>
     </header>
 
+    <div class="app-body">
+
     <!-- Search bar -->
     <div id="search-bar" class="search-bar">
         <div class="search-inner">
@@ -52,6 +54,14 @@
         <div id="ingest-current" class="ingest-current"></div>
     </div>
 
+    <div id="processing-queue" class="processing-queue" style="display:none;">
+        <div class="processing-queue-header">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            <span id="processing-queue-label">Processing queue</span>
+        </div>
+        <div id="processing-queue-list" class="processing-queue-list"></div>
+    </div>
+
     <!-- Sidebar drawer backdrop -->
     <div id="sidebar-backdrop" class="backdrop" id="sidebar-backdrop"></div>
     <!-- Queue panel backdrop -->
@@ -60,56 +70,68 @@
     <div class="layout">
         <!-- Left sidebar -->
         <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <span class="sidebar-title">vanal</span>
-                <button id="btn-drawer-close" class="icon-btn">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
+            <!-- Fixed top: header, controls -->
+            <div class="sidebar-top">
+                <div class="sidebar-header">
+                    <span class="sidebar-title">vanal</span>
+                    <button id="btn-drawer-close" class="icon-btn">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                </div>
+
+                <div class="search-box desktop-only">
+                    <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                    <input type="text" id="search-desktop" placeholder="Search clips...">
+                </div>
+
+                <div class="sidebar-controls">
+                    <select id="sort-select-sidebar" class="sidebar-select">
+                        <option value="filename">By Name</option>
+                        <option value="position">By Position</option>
+                        <option value="duration">By Duration</option>
+                    </select>
+                    <select id="owner-select" class="sidebar-select" style="display:none">
+                        <option value="">All Users</option>
+                    </select>
+                </div>
+
+                <!-- Status as compact inline -->
+                <div id="stats" class="sidebar-stats"></div>
+
+                <!-- Tag filter input -->
+                <div class="tag-filter-box">
+                    <input type="text" id="tag-filter" placeholder="Filter tags...">
+                </div>
             </div>
 
-            <div class="search-box desktop-only">
-                <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                <input type="text" id="search-desktop" placeholder="Search clips...">
-            </div>
-
-            <div class="filter-section">
-                <h3>Sort</h3>
-                <select id="sort-select-sidebar" class="sidebar-select">
-                    <option value="filename">By Name</option>
-                    <option value="position">By Position</option>
-                    <option value="duration">By Duration</option>
-                </select>
-            </div>
-
-            <div class="filter-section">
-                <h3>Tags</h3>
+            <!-- Scrollable: tags -->
+            <div class="sidebar-scroll">
                 <div id="tag-list"></div>
             </div>
 
-            <div class="filter-section">
-                <h3>Status</h3>
-                <div id="stats"></div>
-            </div>
+            <!-- Fixed bottom: actions + user -->
+            <div class="sidebar-bottom">
+                <div class="sidebar-actions">
+                    <button id="btn-ai-order" class="sidebar-action-btn" title="AI Suggest Order">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+                        <span id="btn-ai-order-label">AI Order</span>
+                    </button>
+                    <button id="btn-outputs" class="sidebar-action-btn" title="Outputs">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                        Outputs
+                    </button>
+                    <button id="btn-ingest" class="sidebar-action-btn" title="Ingest Videos">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        Ingest
+                    </button>
+                </div>
 
-            <div class="actions">
-                <button id="btn-ai-order" class="btn btn-primary">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
-                    <span id="btn-ai-order-label">AI Suggest Order</span>
-                </button>
-                <button id="btn-outputs" class="btn">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                    Outputs
-                </button>
-                <button id="btn-ingest" class="btn">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                    Ingest Videos
-                </button>
-                <button id="btn-logout" class="btn" style="display:none;color:var(--text2)">Sign Out</button>
-                <div id="user-info" style="display:none;padding:6px 0 2px">
-                    <div style="display:flex;align-items:center;gap:8px">
-                        <img id="user-avatar" src="" width="26" height="26" style="border-radius:50%;display:none;flex-shrink:0">
-                        <span id="user-name" style="font-size:0.8rem;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+                <div id="sidebar-user-footer" class="sidebar-user-footer" style="display:none">
+                    <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">
+                        <img id="user-avatar" src="" width="24" height="24" style="border-radius:50%;display:none;flex-shrink:0">
+                        <span id="user-name" style="font-size:0.78rem;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
                     </div>
+                    <button id="btn-logout" class="btn btn-sm" style="color:var(--text2);flex-shrink:0;font-size:0.72rem;padding:3px 8px">Sign Out</button>
                 </div>
             </div>
         </aside>
@@ -119,6 +141,15 @@
             <div class="toolbar">
                 <span id="clip-count"></span>
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <button id="btn-upload" class="btn btn-sm">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        Upload
+                    </button>
+                    <input type="file" id="upload-input" accept="video/*" multiple style="display:none">
+                    <div id="upload-status" class="upload-status" style="display:none">
+                        <span id="upload-status-text">Uploading...</span>
+                        <div class="upload-progress-track"><div id="upload-progress-bar" class="upload-progress-bar"></div></div>
+                    </div>
                     <button id="btn-show-queued" class="btn btn-sm" style="display:none">☰ Show Queued</button>
                     <button id="btn-toolbar-montage" class="btn btn-sm btn-primary desktop-only" style="display:none">🎬 Montage (<span id="toolbar-montage-count">0</span>)</button>
                     <div class="toolbar-right mobile-only">
@@ -184,6 +215,8 @@
             </div>
         </aside>
     </div>
+
+    </div><!-- /.app-body -->
 
     <!-- Floating montage button (appears when queue has items) -->
     <button id="btn-fab-montage" class="fab-montage" style="display:none" title="Create Montage from Queue">
@@ -333,6 +366,6 @@
         </div>
     </div>
 
-    <script src="/app.js?v=18"></script>
+    <script src="/app.js?v=19"></script>
 </body>
 </html>

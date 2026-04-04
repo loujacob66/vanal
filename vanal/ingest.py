@@ -99,9 +99,17 @@ def process_file(
             (clip_id,),
         )
 
+    def _set_stage(stage: str):
+        with db.get_conn() as c:
+            c.execute(
+                "UPDATE clips SET processing_stage = ?, updated_at = datetime('now') WHERE id = ?",
+                (stage, clip_id),
+            )
+
     frames_dir = Path(FRAMES_DIR) / file_hash
     try:
         # 1. Probe
+        _set_stage("probing")
         print("  Probing metadata...")
         meta = probe_video(path)
 
@@ -114,6 +122,7 @@ def process_file(
             if reprocess_all and frames_dir.exists():
                 shutil.rmtree(frames_dir, ignore_errors=True)
                 print(f"  Cleared old frames for re-extraction")
+            _set_stage("extracting frames")
             print(f"  Extracting frames (duration={meta['duration']:.1f}s)...")
             frame_paths = extract_frames(
                 path,
@@ -127,6 +136,7 @@ def process_file(
         # 3. Optional transcription
         transcript = None
         if ENABLE_TRANSCRIPTION and meta["has_audio"]:
+            _set_stage("transcribing audio")
             print("  Transcribing audio (whisper)...")
             from vanal.transcribe import transcribe_audio
             transcript = transcribe_audio(path)
@@ -136,9 +146,19 @@ def process_file(
                 print("  No speech detected")
 
         # 4. Vision analysis
+        _set_stage("analyzing video")
         from vanal.vision import VISION_MODEL, TEXT_MODEL
         print(f"  Analyzing frames (vision={VISION_MODEL}, text={TEXT_MODEL})...")
-        vision_result = describe_frames(frame_paths, filename, transcript=transcript)
+
+        def _on_vision_progress(step, current, total):
+            if step == "frames":
+                _set_stage(f"analyzing frames {current}/{total}")
+            elif step == "synopsis":
+                _set_stage("generating synopsis")
+            elif step == "tagging":
+                _set_stage("generating tags")
+
+        vision_result = describe_frames(frame_paths, filename, transcript=transcript, on_progress=_on_vision_progress)
         synopsis = vision_result.get("synopsis", "")
         frame_descriptions = vision_result.get("frames", [])
         auto_tags = vision_result.get("tags", [])
@@ -147,6 +167,7 @@ def process_file(
             print(f"  Tags: {', '.join(auto_tags)}")
 
         # 5. Save to DB — merge auto tags with any existing user-set tags
+        _set_stage("saving results")
         with db.get_conn() as conn:
             existing_tags_row = conn.execute(
                 "SELECT tags FROM clips WHERE id = ?", (clip_id,)
@@ -166,7 +187,7 @@ def process_file(
                     has_audio = ?, metadata_json = ?,
                     synopsis = ?, raw_frames_json = ?, transcript = ?,
                     tags = ?,
-                    status = 'done', error_msg = NULL,
+                    status = 'done', error_msg = NULL, processing_stage = NULL,
                     updated_at = datetime('now')
                 WHERE id = ?""",
                 (
@@ -191,7 +212,7 @@ def process_file(
     except Exception as e:
         with db.get_conn() as conn:
             conn.execute(
-                "UPDATE clips SET status = 'error', error_msg = ?, updated_at = datetime('now') WHERE id = ?",
+                "UPDATE clips SET status = 'error', error_msg = ?, processing_stage = NULL, updated_at = datetime('now') WHERE id = ?",
                 (str(e), clip_id),
             )
         print(f"  ERROR: {e}")

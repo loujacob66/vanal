@@ -18,8 +18,9 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "vanal-outputs"))
 
 
 def _user_output_dir(user: dict) -> Path:
-    """Per-user output directory: {OUTPUT_DIR}/{user_id}/"""
-    d = OUTPUT_DIR / str(user["id"])
+    """Per-user output directory: {OUTPUT_DIR}/{email_prefix}/"""
+    email_prefix = user["email"].split("@")[0].replace("/", "_").replace("\\", "_")
+    d = OUTPUT_DIR / email_prefix
     d.mkdir(parents=True, exist_ok=True)
     return d
 

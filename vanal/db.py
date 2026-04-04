@@ -103,6 +103,7 @@ def migrate():
         for sql in [
             "ALTER TABLE clips ADD COLUMN thumbnail_frame TEXT DEFAULT 'frame_0001.jpg'",
             "ALTER TABLE clips ADD COLUMN owner_id INTEGER REFERENCES users(id)",
+            "ALTER TABLE clips ADD COLUMN processing_stage TEXT",
             "ALTER TABLE ai_order_suggestions ADD COLUMN owner_id INTEGER REFERENCES users(id)",
         ]:
             try:
