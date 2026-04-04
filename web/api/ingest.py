@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from vanal import db
 from vanal.ingest import VIDEO_EXTENSIONS, ingest_directory, OUTPUT_DIR
 from web.api.auth import require_auth
+from web.api.clips import _owner_where
 
 router = APIRouter()
 
@@ -82,8 +83,11 @@ def start_ingest(req: StartIngestRequest, _auth=Depends(require_auth)):
         if not directory.exists():
             raise HTTPException(status_code=400, detail=f"Directory not found: {req.directory}")
 
+        # Capture owner_id before starting the background thread
+        owner_id = _auth["id"]
+
         def run():
-            ingest_directory(directory=directory, reprocess_all=req.reprocess_all)
+            ingest_directory(directory=directory, reprocess_all=req.reprocess_all, owner_id=owner_id)
 
         _ingest_thread = threading.Thread(target=run, daemon=True)
         _ingest_thread.start()
@@ -91,20 +95,25 @@ def start_ingest(req: StartIngestRequest, _auth=Depends(require_auth)):
     return {"ok": True}
 
 
-def _get_all_done_clips():
-    """Return all done clips with a file_hash."""
+def _get_all_done_clips(user: dict | None = None):
+    """Return done clips with a file_hash, optionally scoped to user."""
+    if user:
+        owner_frag, owner_params = _owner_where(user)
+    else:
+        owner_frag, owner_params = "", []
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, file_hash, filepath FROM clips WHERE status = 'done' AND file_hash IS NOT NULL"
+            f"SELECT id, file_hash, filepath FROM clips WHERE status = 'done' AND file_hash IS NOT NULL {owner_frag}",
+            owner_params,
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-def _get_missing_frames_clips():
+def _get_missing_frames_clips(user: dict | None = None):
     """Return done clips that have no extracted frame files on disk."""
     frames_base = Path(os.getenv("FRAMES_DIR", "frames"))
     return [
-        c for c in _get_all_done_clips()
+        c for c in _get_all_done_clips(user)
         if not any((frames_base / c["file_hash"]).glob("frame_*.jpg"))
     ]
 
@@ -116,8 +125,8 @@ class FramesRequest(BaseModel):
 @router.get("/ingest/missing-frames")
 def missing_frames_info(_auth=Depends(require_auth)):
     """Return counts of clips missing frames and current extraction progress."""
-    missing = _get_missing_frames_clips()
-    total_done = len(_get_all_done_clips())
+    missing = _get_missing_frames_clips(_auth)
+    total_done = len(_get_all_done_clips(_auth))
     return {"count": len(missing), "total": total_done, **_frames_progress}
 
 
@@ -131,7 +140,7 @@ def extract_missing_frames(req: FramesRequest = FramesRequest(), _auth=Depends(r
         if _frames_thread is not None and _frames_thread.is_alive():
             raise HTTPException(status_code=409, detail="Frame extraction already running")
 
-        clips = _get_all_done_clips() if req.force else _get_missing_frames_clips()
+        clips = _get_all_done_clips(_auth) if req.force else _get_missing_frames_clips(_auth)
         if not clips:
             return {"ok": True, "count": 0}
 

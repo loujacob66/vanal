@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from vanal import db
 from vanal.vision import suggest_ordering
 from web.api.auth import require_auth
+from web.api.clips import _owner_where
 
 router = APIRouter()
 
@@ -18,19 +19,21 @@ def ai_suggest_order(req: SuggestRequest = Body(default_factory=SuggestRequest),
     """Ask the LLM to suggest a narrative ordering.
 
     If clip_ids is provided, only those clips are ordered (partial ordering).
-    Otherwise all done clips are used.
+    Otherwise all done clips owned by the current user are used.
     """
+    owner_frag, owner_params = _owner_where(_auth)
     with db.get_conn() as conn:
         if req.clip_ids:
             placeholders = ",".join("?" * len(req.clip_ids))
             rows = conn.execute(
-                f"SELECT id, filename, synopsis FROM clips "
-                f"WHERE id IN ({placeholders}) AND status = 'done' ORDER BY filename",
-                req.clip_ids,
+                f"SELECT id, filename, synopsis, owner_id FROM clips "
+                f"WHERE id IN ({placeholders}) AND status = 'done' {owner_frag} ORDER BY filename",
+                req.clip_ids + owner_params,
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, filename, synopsis FROM clips WHERE status = 'done' ORDER BY filename"
+                f"SELECT id, filename, synopsis FROM clips WHERE status = 'done' {owner_frag} ORDER BY filename",
+                owner_params,
             ).fetchall()
 
     if not rows:
@@ -39,11 +42,11 @@ def ai_suggest_order(req: SuggestRequest = Body(default_factory=SuggestRequest),
     clips = [{"id": r["id"], "filename": r["filename"], "synopsis": r["synopsis"]} for r in rows]
     suggestion = suggest_ordering(clips)
 
-    # Store the suggestion
+    # Store the suggestion with owner_id
     with db.get_conn() as conn:
         conn.execute(
-            "INSERT INTO ai_order_suggestions (suggestion_json) VALUES (?)",
-            (json.dumps(suggestion),),
+            "INSERT INTO ai_order_suggestions (suggestion_json, owner_id) VALUES (?, ?)",
+            (json.dumps(suggestion), _auth["id"]),
         )
 
     return {"suggestion": suggestion, "clip_count": len(clips)}
@@ -52,9 +55,11 @@ def ai_suggest_order(req: SuggestRequest = Body(default_factory=SuggestRequest),
 @router.post("/order/apply")
 def apply_order(_auth=Depends(require_auth)):
     """Apply the most recent AI suggestion to clip positions."""
+    owner_frag, owner_params = _owner_where(_auth)
     with db.get_conn() as conn:
         row = conn.execute(
-            "SELECT id, suggestion_json FROM ai_order_suggestions WHERE applied = 0 ORDER BY id DESC LIMIT 1"
+            f"SELECT id, suggestion_json FROM ai_order_suggestions WHERE applied = 0 {owner_frag} ORDER BY id DESC LIMIT 1",
+            owner_params,
         ).fetchone()
 
         if not row:
@@ -79,10 +84,12 @@ def apply_order(_auth=Depends(require_auth)):
 
 
 @router.get("/order/history")
-def order_history():
-    """Get past AI ordering suggestions."""
+def order_history(_auth=Depends(require_auth)):
+    """Get past AI ordering suggestions for the current user."""
+    owner_frag, owner_params = _owner_where(_auth)
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, created_at, applied FROM ai_order_suggestions ORDER BY id DESC LIMIT 10"
+            f"SELECT id, created_at, applied FROM ai_order_suggestions WHERE 1=1 {owner_frag} ORDER BY id DESC LIMIT 10",
+            owner_params,
         ).fetchall()
     return [dict(r) for r in rows]

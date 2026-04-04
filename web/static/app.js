@@ -10,10 +10,12 @@ let queue          = [];       // ordered array of clip IDs (the "selected" work
 let pendingQueueSuggestion = null; // AI-suggested order for queue, waiting for apply
 let showQueuedOnly = false;   // filter grid to queued clips only
 let isAuthenticated = false;  // set after /api/auth/status check
+let currentUser = null;       // user dict from /api/auth/status
 
 // ─── Init ─────────────────────────────────────────────────────────
-document.addEventListener("DOMContentLoaded", () => {
-    initAuth();
+document.addEventListener("DOMContentLoaded", async () => {
+    await initAuth();
+    if (!isAuthenticated) return;  // show login screen, don't load anything
     loadClips();
     pollIngestStatus();
     initDrawer();
@@ -1209,69 +1211,44 @@ async function initAuth() {
     const resp = await fetch("/api/auth/status");
     const data = await resp.json();
     isAuthenticated = data.authenticated;
-    applyAuthState(data.required);
+    currentUser = data.user || null;
+    applyAuthState();
 
-    document.getElementById("btn-login-submit").addEventListener("click", submitLogin);
-    document.getElementById("login-password").addEventListener("keydown", (e) => {
-        if (e.key === "Enter") submitLogin();
-    });
     document.getElementById("btn-logout")?.addEventListener("click", async () => {
         await fetch("/api/auth/logout", { method: "POST" });
-        isAuthenticated = false;
-        applyAuthState(true);
+        window.location.reload();
     });
 }
 
-function applyAuthState(authRequired) {
-    // Show logout button only when logged in and auth is enabled
-    const logoutBtn = document.getElementById("btn-logout");
-    if (logoutBtn) logoutBtn.style.display = isAuthenticated && authRequired ? "block" : "none";
+function applyAuthState() {
+    if (!isAuthenticated) {
+        // Gate entire app: show login overlay, hide everything else
+        document.getElementById("login-overlay").style.display = "flex";
+        document.getElementById("loading").textContent = "";
+        return;
+    }
 
-    // Show a "Sign in" hint in the header queue button when auth required and not logged in
-    const queueToggle = document.getElementById("btn-queue-toggle");
-    if (queueToggle) queueToggle.title = (!authRequired || isAuthenticated) ? "Queue" : "Queue (sign in to make changes)";
+    const logoutBtn = document.getElementById("btn-logout");
+    if (logoutBtn) logoutBtn.style.display = "block";
+
+    const userInfo = document.getElementById("user-info");
+    if (userInfo && currentUser) {
+        userInfo.style.display = "block";
+        document.getElementById("user-name").textContent = currentUser.name || currentUser.email;
+        const avatar = document.getElementById("user-avatar");
+        if (currentUser.picture_url) {
+            avatar.src = currentUser.picture_url;
+            avatar.style.display = "inline-block";
+        }
+    }
 }
 
-function showLoginModal(onSuccess) {
-    const overlay = document.getElementById("login-overlay");
-    document.getElementById("login-password").value = "";
-    document.getElementById("login-error").style.display = "none";
-    overlay.style.display = "flex";
-    setTimeout(() => document.getElementById("login-password").focus(), 50);
-    overlay._onSuccess = onSuccess;
+function showLoginModal(_onSuccess) {
+    document.getElementById("login-overlay").style.display = "flex";
 }
 
 function closeLoginModal() {
     document.getElementById("login-overlay").style.display = "none";
-}
-
-async function submitLogin() {
-    const password = document.getElementById("login-password").value;
-    const errEl = document.getElementById("login-error");
-    const btn = document.getElementById("btn-login-submit");
-    btn.disabled = true;
-    btn.textContent = "Signing in...";
-    errEl.style.display = "none";
-
-    try {
-        const resp = await fetch("/api/auth/login", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ password }),
-        });
-        if (resp.ok) {
-            isAuthenticated = true;
-            closeLoginModal();
-            applyAuthState(true);
-            const cb = document.getElementById("login-overlay")._onSuccess;
-            if (cb) cb();
-        } else {
-            errEl.style.display = "inline";
-        }
-    } finally {
-        btn.disabled = false;
-        btn.textContent = "Sign In";
-    }
 }
 
 // Wrap any action that requires auth
@@ -1279,7 +1256,7 @@ function requireAuth(action) {
     if (isAuthenticated) {
         action();
     } else {
-        showLoginModal(action);
+        showLoginModal();
     }
 }
 

@@ -32,7 +32,7 @@ def _get_existing(conn, file_hash: str) -> dict | None:
     return dict(row) if row else None
 
 
-def _upsert_pending(conn, filename: str, filepath: str, file_hash: str) -> int:
+def _upsert_pending(conn, filename: str, filepath: str, file_hash: str, owner_id: int | None = None) -> int:
     existing = conn.execute(
         "SELECT id FROM clips WHERE file_hash = ?", (file_hash,)
     ).fetchone()
@@ -43,8 +43,8 @@ def _upsert_pending(conn, filename: str, filepath: str, file_hash: str) -> int:
         )
         return existing["id"]
     cursor = conn.execute(
-        "INSERT INTO clips (filename, filepath, file_hash, status) VALUES (?, ?, ?, 'pending')",
-        (filename, filepath, file_hash),
+        "INSERT INTO clips (filename, filepath, file_hash, status, owner_id) VALUES (?, ?, ?, 'pending', ?)",
+        (filename, filepath, file_hash, owner_id),
     )
     return cursor.lastrowid
 
@@ -63,6 +63,7 @@ def process_file(
     keep_frames: bool = False,
     delay_secs: float = 1.0,
     reprocess_all: bool = False,
+    owner_id: int | None = None,
 ) -> str:
     """
     Process a single video file. Returns status: 'done', 'skipped', or 'error'.
@@ -92,7 +93,7 @@ def process_file(
                 print("  Skipping (previous error; use --retry-errors to retry)")
                 return "skipped"
 
-        clip_id = _upsert_pending(conn, filename, filepath, file_hash)
+        clip_id = _upsert_pending(conn, filename, filepath, file_hash, owner_id=owner_id)
         conn.execute(
             "UPDATE clips SET status = 'processing', error_msg = NULL, updated_at = datetime('now') WHERE id = ?",
             (clip_id,),
@@ -209,6 +210,7 @@ def ingest_directory(
     delay_secs: float = 1.0,
     base_path_remap: str | None = None,
     reprocess_all: bool = False,
+    owner_id: int | None = None,
 ):
     """Scan a directory (or single file) and process all video files."""
     directory = Path(directory)
@@ -256,6 +258,7 @@ def ingest_directory(
             keep_frames=keep_frames,
             delay_secs=delay_secs,
             reprocess_all=reprocess_all,
+            owner_id=owner_id,
         )
         stats[status] = stats.get(status, 0) + 1
 

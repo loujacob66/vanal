@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -12,31 +12,53 @@ from web.api.auth import require_auth
 router = APIRouter()
 
 
+# ── Ownership helpers ──────────────────────────────────────────────
+def _owner_where(user: dict) -> tuple[str, list]:
+    """Return (SQL fragment, params) to scope queries by owner_id.  Admin sees all."""
+    if user["is_admin"]:
+        return "", []
+    return " AND owner_id = ?", [user["id"]]
+
+
+def get_user_clip(conn, clip_id: int, user: dict, columns: str = "*") -> dict:
+    """Fetch a clip and verify ownership.  Admin can access any clip.  Raises 404/403."""
+    row = conn.execute(f"SELECT {columns} FROM clips WHERE id = ?", (clip_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip = dict(row)
+    if not user["is_admin"] and clip.get("owner_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return clip
+
+
+# ── Routes ─────────────────────────────────────────────────────────
 @router.get("/ingest/status")
-def ingest_status():
+def ingest_status(_auth=Depends(require_auth)):
     """Return live ingest progress counts, including the currently-processing clip."""
+    owner_frag, owner_params = _owner_where(_auth)
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT status, COUNT(*) as count FROM clips GROUP BY status"
+            f"SELECT status, COUNT(*) as count FROM clips WHERE 1=1 {owner_frag} GROUP BY status",
+            owner_params,
         ).fetchall()
         counts = {r["status"]: r["count"] for r in rows}
 
         current = conn.execute(
-            "SELECT filename, updated_at FROM clips WHERE status='processing' ORDER BY updated_at DESC LIMIT 1"
+            f"SELECT filename, updated_at FROM clips WHERE status='processing' {owner_frag} ORDER BY updated_at DESC LIMIT 1",
+            owner_params,
         ).fetchone()
 
     total = sum(counts.values())
     done = counts.get("done", 0)
 
     # Treat 'processing' clips as stale if not updated in the last 10 minutes
-    # (happens when ingest is killed mid-run)
     processing = counts.get("processing", 0)
     if processing > 0 and current:
         from datetime import datetime, timezone
         try:
             last = datetime.fromisoformat(current["updated_at"])
             age = (datetime.utcnow() - last).total_seconds()
-            if age > 600:  # 10 minutes
+            if age > 600:
                 processing = 0
                 current = None
         except Exception:
@@ -58,53 +80,48 @@ def list_clips(
     search: str | None = Query(None),
     tag: str | None = Query(None),
     sort: str = Query("filename"),
+    _auth=Depends(require_auth),
 ):
-    """List all clips, with optional search and tag filter."""
+    """List clips owned by the current user (admin sees all)."""
+    owner_frag, owner_params = _owner_where(_auth)
     with db.get_conn() as conn:
         if search:
-            # Use FTS for keyword search
             rows = conn.execute(
-                """SELECT c.* FROM clips c
+                f"""SELECT c.* FROM clips c
                    JOIN clips_fts f ON c.id = f.rowid
-                   WHERE clips_fts MATCH ?
+                   WHERE clips_fts MATCH ? {owner_frag}
                    ORDER BY CASE WHEN ? = 'position' THEN c.position ELSE NULL END,
                            c.filename""",
-                (search, sort),
+                [search] + owner_params + [sort],
             ).fetchall()
         elif tag:
             rows = conn.execute(
-                """SELECT * FROM clips
-                   WHERE ',' || tags || ',' LIKE ?
+                f"""SELECT * FROM clips
+                   WHERE ',' || tags || ',' LIKE ? {owner_frag}
                    ORDER BY CASE WHEN ? = 'position' THEN position ELSE NULL END,
                            filename""",
-                (f"%,{tag},%", sort),
+                [f"%,{tag},%"] + owner_params + [sort],
             ).fetchall()
         else:
             order = "position, filename" if sort == "position" else "filename"
             rows = conn.execute(
-                f"SELECT * FROM clips ORDER BY {order}"
+                f"SELECT * FROM clips WHERE 1=1 {owner_frag} ORDER BY {order}",
+                owner_params,
             ).fetchall()
 
         return [_row_to_dict(r) for r in rows]
 
 
 @router.get("/clips/{clip_id}/video")
-def stream_clip(clip_id: int, request: Request):
+def stream_clip(clip_id: int, request: Request, _auth=Depends(require_auth)):
     """Stream the original video file for in-browser playback."""
     with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT filepath FROM clips WHERE id = ?", (clip_id,)
-        ).fetchone()
-        if not row:
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"error": "Clip not found"}, status_code=404)
+        clip = get_user_clip(conn, clip_id, _auth, columns="filepath")
 
-    path = Path(row["filepath"])
+    path = Path(clip["filepath"])
     if not path.exists():
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"error": f"File not found: {path}"}, status_code=404)
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
 
-    # Determine media type from extension
     ext = path.suffix.lower()
     media_types = {
         ".mp4": "video/mp4", ".mov": "video/quicktime",
@@ -112,17 +129,14 @@ def stream_clip(clip_id: int, request: Request):
         ".webm": "video/webm", ".m4v": "video/mp4",
     }
     media_type = media_types.get(ext, "video/mp4")
-
     return FileResponse(path, media_type=media_type, filename=path.name)
 
 
 @router.get("/clips/{clip_id}")
-def get_clip(clip_id: int):
+def get_clip(clip_id: int, _auth=Depends(require_auth)):
     with db.get_conn() as conn:
-        row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
-        if not row:
-            return {"error": "Clip not found"}, 404
-        return _row_to_dict(row)
+        clip = get_user_clip(conn, clip_id, _auth)
+        return _row_to_dict(clip)
 
 
 class ClipUpdate(BaseModel):
@@ -135,9 +149,7 @@ class ClipUpdate(BaseModel):
 @router.patch("/clips/{clip_id}")
 def update_clip(clip_id: int, update: ClipUpdate, _auth=Depends(require_auth)):
     with db.get_conn() as conn:
-        row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
-        if not row:
-            return {"error": "Clip not found"}, 404
+        get_user_clip(conn, clip_id, _auth, columns="id, owner_id")
 
         fields = []
         values = []
@@ -178,12 +190,8 @@ def update_clip(clip_id: int, update: ClipUpdate, _auth=Depends(require_auth)):
 def transcribe_clip(clip_id: int, _auth=Depends(require_auth)):
     """Run Whisper transcription on a single clip on-demand."""
     with db.get_conn() as conn:
-        row = conn.execute("SELECT id, filename, filepath FROM clips WHERE id = ?", (clip_id,)).fetchone()
-        if not row:
-            return {"error": "Clip not found"}, 404
-        clip = dict(row)
+        clip = get_user_clip(conn, clip_id, _auth, columns="id, filename, filepath, owner_id")
 
-    from pathlib import Path
     if not Path(clip["filepath"]).exists():
         return {"error": f"File not found at {clip['filepath']}"}
 
@@ -201,7 +209,6 @@ def transcribe_clip(clip_id: int, _auth=Depends(require_auth)):
             "UPDATE clips SET transcript = ?, updated_at = datetime('now') WHERE id = ?",
             (transcript, clip_id),
         )
-        # Update FTS
         row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
         conn.execute("DELETE FROM clips_fts WHERE rowid = ?", (clip_id,))
         conn.execute(
@@ -217,12 +224,8 @@ def transcribe_clip(clip_id: int, _auth=Depends(require_auth)):
 def regenerate_synopsis(clip_id: int, _auth=Depends(require_auth)):
     """Re-synthesize the synopsis using existing frame descriptions, transcript, and notes."""
     with db.get_conn() as conn:
-        row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
-        if not row:
-            return {"error": "Clip not found"}, 404
-        clip = dict(row)
+        clip = get_user_clip(conn, clip_id, _auth)
 
-    # Reconstruct frame descriptions from stored JSON
     frame_descriptions = []
     if clip.get("raw_frames_json"):
         try:
@@ -279,21 +282,15 @@ def regenerate_synopsis(clip_id: int, _auth=Depends(require_auth)):
 
 @router.post("/clips/{clip_id}/extract-frames")
 def extract_clip_frames(clip_id: int, _auth=Depends(require_auth)):
-    """Re-extract frames for a clip that's missing them (no full reprocess needed)."""
+    """Re-extract frames for a clip that's missing them."""
     with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT filepath, file_hash, duration FROM clips WHERE id = ?", (clip_id,)
-        ).fetchone()
-        if not row:
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"error": "Clip not found"}, status_code=404)
+        clip = get_user_clip(conn, clip_id, _auth, columns="id, filepath, file_hash, duration, owner_id")
 
-    filepath = Path(row["filepath"])
+    filepath = Path(clip["filepath"])
     if not filepath.exists():
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"error": f"File not found: {filepath}"}, status_code=404)
+        raise HTTPException(status_code=404, detail=f"File not found: {filepath}")
 
-    frames_dir = Path(os.getenv("FRAMES_DIR", "frames")) / row["file_hash"]
+    frames_dir = Path(os.getenv("FRAMES_DIR", "frames")) / clip["file_hash"]
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     from vanal.extractor import extract_frames, probe_video
@@ -311,33 +308,28 @@ def extract_clip_frames(clip_id: int, _auth=Depends(require_auth)):
         frames = sorted(f.name for f in frame_paths)
         return {"ok": True, "frames": frames}
     except Exception as e:
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"error": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/clips/{clip_id}/frames")
-def list_clip_frames(clip_id: int):
+def list_clip_frames(clip_id: int, _auth=Depends(require_auth)):
     """Return sorted list of extracted frame filenames available for this clip."""
     with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT file_hash, thumbnail_frame FROM clips WHERE id = ?", (clip_id,)
-        ).fetchone()
-        if not row:
-            return {"error": "Clip not found"}, 404
+        clip = get_user_clip(conn, clip_id, _auth, columns="id, file_hash, thumbnail_frame, owner_id")
 
-    frames_dir = Path(os.getenv("FRAMES_DIR", "frames")) / row["file_hash"]
+    frames_dir = Path(os.getenv("FRAMES_DIR", "frames")) / clip["file_hash"]
     if not frames_dir.exists():
-        return {"frames": [], "thumbnail_frame": row["thumbnail_frame"] or "frame_0001.jpg"}
+        return {"frames": [], "thumbnail_frame": clip["thumbnail_frame"] or "frame_0001.jpg"}
 
     frames = sorted(f.name for f in frames_dir.glob("frame_*.jpg"))
     return {
         "frames": frames,
-        "thumbnail_frame": row["thumbnail_frame"] or "frame_0001.jpg",
+        "thumbnail_frame": clip["thumbnail_frame"] or "frame_0001.jpg",
     }
 
 
 class ThumbnailRequest(BaseModel):
-    frame: str  # e.g. "frame_0003.jpg"
+    frame: str
 
 
 @router.post("/clips/{clip_id}/thumbnail")
@@ -345,18 +337,13 @@ def set_thumbnail(clip_id: int, req: ThumbnailRequest, _auth=Depends(require_aut
     """Set the preferred thumbnail frame for a clip."""
     import re
     if not re.match(r'^frame_\d+\.jpg$', req.frame):
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Invalid frame name")
 
     with db.get_conn() as conn:
-        row = conn.execute("SELECT file_hash FROM clips WHERE id = ?", (clip_id,)).fetchone()
-        if not row:
-            return {"error": "Clip not found"}, 404
+        clip = get_user_clip(conn, clip_id, _auth, columns="id, file_hash, owner_id")
 
-        # Verify the frame actually exists on disk
-        frame_path = Path(os.getenv("FRAMES_DIR", "frames")) / row["file_hash"] / req.frame
+        frame_path = Path(os.getenv("FRAMES_DIR", "frames")) / clip["file_hash"] / req.frame
         if not frame_path.exists():
-            from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Frame not found on disk")
 
         conn.execute(
@@ -370,10 +357,7 @@ def set_thumbnail(clip_id: int, req: ThumbnailRequest, _auth=Depends(require_aut
 def regenerate_tags(clip_id: int, _auth=Depends(require_auth)):
     """Re-generate content tags from stored frame descriptions, synopsis, and transcript."""
     with db.get_conn() as conn:
-        row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
-        if not row:
-            return {"error": "Clip not found"}, 404
-        clip = dict(row)
+        clip = get_user_clip(conn, clip_id, _auth)
 
     frame_descriptions = []
     if clip.get("raw_frames_json"):
@@ -397,7 +381,6 @@ def regenerate_tags(clip_id: int, _auth=Depends(require_auth)):
     if not auto_tags:
         return {"error": "Tag generation failed — check that Ollama is running and the text model is available"}
 
-    # Merge with any existing user tags
     existing = [t.strip() for t in (clip.get("tags") or "").split(",") if t.strip()]
     merged = list(dict.fromkeys(existing + auto_tags))
     tags_str = ", ".join(merged)
@@ -429,6 +412,9 @@ class ReorderRequest(BaseModel):
 @router.post("/clips/reorder")
 def reorder_clips(request: ReorderRequest, _auth=Depends(require_auth)):
     with db.get_conn() as conn:
+        # Verify ownership of all clips being reordered
+        for item in request.items:
+            get_user_clip(conn, item.id, _auth, columns="id, owner_id")
         for item in request.items:
             conn.execute(
                 "UPDATE clips SET position = ?, updated_at = datetime('now') WHERE id = ?",
@@ -438,8 +424,7 @@ def reorder_clips(request: ReorderRequest, _auth=Depends(require_auth)):
 
 
 def _row_to_dict(row) -> dict:
-    d = dict(row)
-    # Parse JSON fields for the API response
+    d = dict(row) if not isinstance(row, dict) else row
     if d.get("raw_frames_json"):
         try:
             d["raw_frames"] = json.loads(d["raw_frames_json"])
@@ -454,7 +439,6 @@ def _row_to_dict(row) -> dict:
             d["metadata"] = {}
     else:
         d["metadata"] = {}
-    # Don't send raw JSON strings to frontend
     d.pop("raw_frames_json", None)
     d.pop("metadata_json", None)
     return d

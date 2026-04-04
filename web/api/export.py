@@ -10,35 +10,43 @@ from pydantic import BaseModel
 
 from vanal import db
 from web.api.auth import require_auth
+from web.api.clips import _owner_where, get_user_clip
 
 router = APIRouter()
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "vanal-outputs"))
 
 
-def _ensure_output_dir():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def _user_output_dir(user: dict) -> Path:
+    """Per-user output directory: {OUTPUT_DIR}/{user_id}/"""
+    d = OUTPUT_DIR / str(user["id"])
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 @router.get("/export/json")
-def export_json():
+def export_json(_auth=Depends(require_auth)):
     """Export ordered clip list as JSON."""
+    owner_frag, owner_params = _owner_where(_auth)
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, filename, filepath, synopsis, position, tags, duration "
-            "FROM clips WHERE status = 'done' "
-            "ORDER BY position NULLS LAST, filename"
+            f"SELECT id, filename, filepath, synopsis, position, tags, duration "
+            f"FROM clips WHERE status = 'done' {owner_frag} "
+            f"ORDER BY position NULLS LAST, filename",
+            owner_params,
         ).fetchall()
     return [dict(r) for r in rows]
 
 
 @router.get("/export/ffmpeg-concat")
-def export_ffmpeg_concat():
+def export_ffmpeg_concat(_auth=Depends(require_auth)):
     """Export as an ffmpeg concat demuxer manifest."""
+    owner_frag, owner_params = _owner_where(_auth)
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT filepath, duration FROM clips WHERE status = 'done' "
-            "ORDER BY position NULLS LAST, filename"
+            f"SELECT filepath, duration FROM clips WHERE status = 'done' {owner_frag} "
+            f"ORDER BY position NULLS LAST, filename",
+            owner_params,
         ).fetchall()
 
     if not rows:
@@ -57,25 +65,25 @@ def export_ffmpeg_concat():
 
 class RenderRequest(BaseModel):
     clip_ids: list[int]
-    filename: str = ""        # optional base name; auto-generated if blank
-    reencode: bool = False    # True = libx264/aac re-encode (slower, always compatible)
+    filename: str = ""
+    reencode: bool = False
 
 
 @router.post("/export/render")
 def render_montage(req: RenderRequest, _auth=Depends(require_auth)):
-    """Concatenate selected clips into a streamable MP4 saved to OUTPUT_DIR."""
+    """Concatenate selected clips into a streamable MP4 saved to per-user output dir."""
     if not req.clip_ids:
         return JSONResponse({"error": "No clips selected"}, status_code=400)
 
     with db.get_conn() as conn:
-        placeholders = ",".join("?" * len(req.clip_ids))
-        rows = conn.execute(
-            f"SELECT id, filepath FROM clips WHERE id IN ({placeholders})",
-            req.clip_ids,
-        ).fetchall()
+        # Verify ownership of all clips
+        clip_rows = []
+        for cid in req.clip_ids:
+            clip = get_user_clip(conn, cid, _auth, columns="id, filepath, owner_id")
+            clip_rows.append(clip)
 
     # Preserve the requested order
-    id_to_path = {r["id"]: r["filepath"] for r in rows}
+    id_to_path = {r["id"]: r["filepath"] for r in clip_rows}
     paths = []
     missing = []
     for cid in req.clip_ids:
@@ -91,21 +99,18 @@ def render_montage(req: RenderRequest, _auth=Depends(require_auth)):
     if not paths:
         return JSONResponse({"error": "None of the selected clips have accessible files"}, status_code=400)
 
-    _ensure_output_dir()
+    user_out = _user_output_dir(_auth)
 
     # Build output filename
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = req.filename.strip() or "montage"
-    # Sanitise: keep alphanumeric, dashes, underscores
     safe_base = "".join(c if c.isalnum() or c in "-_" else "_" for c in base)
     out_filename = f"{safe_base}_{ts}.mp4"
-    out_path = OUTPUT_DIR / out_filename
+    out_path = user_out / out_filename
 
-    # Write concat list to a temp file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         tmp_list = f.name
         for p in paths:
-            # ffconcat requires single-quoted paths; escape any single quotes
             escaped = p.replace("'", "'\\''")
             f.write(f"file '{escaped}'\n")
 
@@ -132,7 +137,7 @@ def render_montage(req: RenderRequest, _auth=Depends(require_auth)):
         if result.returncode != 0:
             return JSONResponse({
                 "error": "ffmpeg failed",
-                "details": result.stderr[-2000:],  # last 2k chars of stderr
+                "details": result.stderr[-2000:],
             }, status_code=500)
     except subprocess.TimeoutExpired:
         return JSONResponse({"error": "ffmpeg timed out after 10 minutes"}, status_code=500)
@@ -150,12 +155,11 @@ def render_montage(req: RenderRequest, _auth=Depends(require_auth)):
 
 
 @router.get("/outputs")
-def list_outputs():
-    """List all rendered montages in OUTPUT_DIR."""
-    if not OUTPUT_DIR.exists():
-        return []
+def list_outputs(_auth=Depends(require_auth)):
+    """List rendered montages in the current user's output dir."""
+    user_out = _user_output_dir(_auth)
 
-    files = sorted(OUTPUT_DIR.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
+    files = sorted(user_out.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
     result = []
     for f in files:
         stat = f.stat()
@@ -168,13 +172,12 @@ def list_outputs():
 
 
 @router.get("/outputs/{filename}/video")
-def stream_output(filename: str):
+def stream_output(filename: str, _auth=Depends(require_auth)):
     """Stream a rendered montage for in-browser playback / download."""
-    # Safety: no path traversal
     if "/" in filename or "\\" in filename or ".." in filename:
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
-    path = OUTPUT_DIR / filename
+    path = _user_output_dir(_auth) / filename
     if not path.exists():
         return JSONResponse({"error": "File not found"}, status_code=404)
 
@@ -187,7 +190,7 @@ def delete_output(filename: str, _auth=Depends(require_auth)):
     if "/" in filename or "\\" in filename or ".." in filename:
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
-    path = OUTPUT_DIR / filename
+    path = _user_output_dir(_auth) / filename
     if not path.exists():
         return JSONResponse({"error": "File not found"}, status_code=404)
 

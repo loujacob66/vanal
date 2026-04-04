@@ -34,6 +34,17 @@ def migrate():
     # before running which can corrupt WAL state on a fresh or crashed database.
     with get_conn() as conn:
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                email       TEXT UNIQUE NOT NULL,
+                name        TEXT,
+                picture_url TEXT,
+                is_admin    INTEGER DEFAULT 0,
+                created_at  TEXT DEFAULT (datetime('now')),
+                updated_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS clips (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 filename        TEXT NOT NULL,
@@ -62,6 +73,7 @@ def migrate():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clips_status   ON clips(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clips_position ON clips(position)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clips_hash     ON clips(file_hash)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_clips_owner   ON clips(owner_id)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ai_order_suggestions (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +102,8 @@ def migrate():
         # Additive migrations — safe to run repeatedly
         for sql in [
             "ALTER TABLE clips ADD COLUMN thumbnail_frame TEXT DEFAULT 'frame_0001.jpg'",
+            "ALTER TABLE clips ADD COLUMN owner_id INTEGER REFERENCES users(id)",
+            "ALTER TABLE ai_order_suggestions ADD COLUMN owner_id INTEGER REFERENCES users(id)",
         ]:
             try:
                 conn.execute(sql)
