@@ -27,7 +27,7 @@ def _parse_json_response(text: str) -> dict | list:
     return json.loads(text.strip())
 
 
-def _ollama_generate(model: str, prompt: str, images: list[str] | None = None) -> str:
+def _ollama_generate(model: str, prompt: str, images: list[str] | None = None, json_mode: bool = False) -> str:
     """Call Ollama generate API and return the response text."""
     payload = {
         "model": model,
@@ -37,6 +37,8 @@ def _ollama_generate(model: str, prompt: str, images: list[str] | None = None) -
             "temperature": 0.3,
         },
     }
+    if json_mode:
+        payload["format"] = "json"
     if images:
         payload["images"] = images
 
@@ -132,36 +134,24 @@ def generate_tags(
     Ask the text model to produce a list of descriptive content tags for a clip.
     Returns a list of lowercase tag strings.
     """
-    descriptions_text = "\n".join(
-        f"Frame {i + 1}: {d}" for i, d in enumerate(frame_descriptions)
-    )
-    transcript_section = f'\n\nAudio transcript: "{transcript}"' if transcript else ""
-
+    transcript_section = f' Transcript: "{transcript}"' if transcript else ""
     prompt = (
-        f"You are tagging a short video clip for a searchable media library.\n\n"
-        f"Filename: {filename}\n"
-        f"Synopsis: {synopsis}\n\n"
-        f"Frame-by-frame descriptions:\n{descriptions_text}"
-        f"{transcript_section}\n\n"
-        "Generate 5–15 concise, lowercase tags that accurately describe this clip. Include tags for:\n"
-        "- Setting / environment (e.g. kitchen, beach, indoor, outdoor, night)\n"
-        "- Subjects visible (e.g. person, child, dog, food, cake, car)\n"
-        "- Actions or events (e.g. cooking, swimming, birthday, wedding, dancing)\n"
-        "- Mood or tone (e.g. funny, emotional, energetic, calm)\n"
-        "- Any notable or unusual content — use the specific word for it "
-        "(e.g. vomit, fire, blood, fall, crying, explosion, smoke)\n\n"
-        "Rules:\n"
-        "- Return ONLY a valid JSON array of strings, nothing else\n"
-        "- All tags lowercase, 1-3 words each\n"
-        "- Be specific, not generic (avoid tags like 'video', 'clip', 'scene')\n"
-        "- If something unusual or striking is present, always include it\n\n"
-        'Example: ["birthday", "cake", "indoor", "child", "funny", "candles", "party"]'
+        f'Tag this video clip for a searchable library.\n'
+        f'Filename: {filename}\n'
+        f'Description: {synopsis}{transcript_section}\n\n'
+        f'Return a JSON array of 5-15 lowercase tags (setting, subjects, actions, mood, notable content).\n'
+        f'Example: ["kitchen", "woman", "cooking", "calm", "indoor"]\n'
+        f'Tags:'
     )
 
     for attempt in range(MAX_RETRIES):
         try:
-            response_text = _ollama_generate(TEXT_MODEL, prompt).strip()
+            response_text = _ollama_generate(TEXT_MODEL, prompt, json_mode=True).strip()
+            if not response_text:
+                raise ValueError("Empty response from model")
             parsed = _parse_json_response(response_text)
+            if isinstance(parsed, dict):
+                parsed = parsed.get("tags", parsed.get("Tags", []))
             if isinstance(parsed, list):
                 # Clean and deduplicate
                 tags = list(dict.fromkeys(
@@ -208,7 +198,7 @@ def suggest_ordering(clips: list[dict]) -> list[dict]:
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            response_text = _ollama_generate(TEXT_MODEL, prompt)
+            response_text = _ollama_generate(TEXT_MODEL, prompt, json_mode=True)
             result = _parse_json_response(response_text)
             if not isinstance(result, list):
                 raise ValueError("Expected a JSON array")

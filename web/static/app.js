@@ -20,6 +20,7 @@ document.addEventListener("DOMContentLoaded", () => {
     initQueuePanel();
     initBottomNav();
     initSearchToggle();
+    initIngestModal();
 
     document.getElementById("btn-show-queued").addEventListener("click", toggleShowQueued);
     document.getElementById("btn-fab-montage").addEventListener("click", () => requireAuth(openMontageModal));
@@ -1280,6 +1281,266 @@ function requireAuth(action) {
     } else {
         showLoginModal(action);
     }
+}
+
+// ─── Ingest Modal ─────────────────────────────────────────────────
+function initIngestModal() {
+    document.getElementById("btn-ingest").addEventListener("click", () => {
+        requireAuth(() => { closeDrawer(); openIngestModal(); });
+    });
+    document.getElementById("btn-fix-thumbnails").addEventListener("click", () => onExtractFrames(false));
+    document.getElementById("btn-reextract-all-thumbnails").addEventListener("click", () => onExtractFrames(true));
+    document.getElementById("ingest-close").addEventListener("click", closeIngestModal);
+    document.getElementById("btn-ingest-modal-cancel").addEventListener("click", closeIngestModal);
+    document.getElementById("ingest-overlay").addEventListener("click", (e) => {
+        if (e.target === e.currentTarget) closeIngestModal();
+    });
+    document.getElementById("btn-ingest-preview").addEventListener("click", onIngestPreview);
+    document.getElementById("ingest-reprocess-all").addEventListener("change", onReprocessAllToggle);
+    document.getElementById("btn-ingest-start").addEventListener("click", onIngestStart);
+
+    // Folder picker
+    document.getElementById("btn-folder-browse").addEventListener("click", () => openFolderPicker());
+    document.getElementById("folder-picker-close").addEventListener("click", closeFolderPicker);
+    document.getElementById("btn-folder-picker-cancel").addEventListener("click", closeFolderPicker);
+    document.getElementById("folder-picker-overlay").addEventListener("click", (e) => {
+        if (e.target === e.currentTarget) closeFolderPicker();
+    });
+    document.getElementById("btn-folder-picker-select").addEventListener("click", onFolderPickerSelect);
+}
+
+// ─── Folder Picker ────────────────────────────────────────────────
+let _folderPickerCurrent = "";
+
+async function openFolderPicker(path) {
+    document.getElementById("folder-picker-overlay").style.display = "flex";
+    await navigateFolderPicker(path || document.getElementById("ingest-dir-input").value.trim() || "");
+}
+
+function closeFolderPicker() {
+    document.getElementById("folder-picker-overlay").style.display = "none";
+}
+
+function onFolderPickerSelect() {
+    document.getElementById("ingest-dir-input").value = _folderPickerCurrent;
+    closeFolderPicker();
+}
+
+async function navigateFolderPicker(path) {
+    const list = document.getElementById("folder-picker-list");
+    const pathEl = document.getElementById("folder-picker-path");
+    list.innerHTML = `<div class="folder-picker-item" style="color:var(--text2);cursor:default">Loading…</div>`;
+
+    try {
+        const params = path ? `?path=${encodeURIComponent(path)}` : "";
+        const resp = await fetch(`/api/fs/browse${params}`);
+        const data = await resp.json();
+        if (!resp.ok) {
+            list.innerHTML = `<div class="folder-picker-item" style="color:var(--red);cursor:default">${esc(data.detail || "Error")}</div>`;
+            return;
+        }
+
+        _folderPickerCurrent = data.path;
+        pathEl.textContent = data.path;
+
+        const folderSvg = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+        const upSvg = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>`;
+
+        let html = "";
+        if (data.parent) {
+            html += `<div class="folder-picker-item up" data-path="${esc(data.parent)}">${upSvg} .. (up one level)</div>`;
+        }
+        if (data.dirs.length === 0 && !data.parent) {
+            html += `<div class="folder-picker-item" style="color:var(--text2);cursor:default">No subdirectories</div>`;
+        }
+        html += data.dirs.map(d => {
+            const full = data.path.endsWith("/") ? data.path + d : data.path + "/" + d;
+            return `<div class="folder-picker-item" data-path="${esc(full)}">${folderSvg} ${esc(d)}</div>`;
+        }).join("");
+        list.innerHTML = html;
+
+        list.querySelectorAll(".folder-picker-item[data-path]").forEach(item => {
+            item.addEventListener("click", () => navigateFolderPicker(item.dataset.path));
+        });
+    } catch (err) {
+        list.innerHTML = `<div class="folder-picker-item" style="color:var(--red);cursor:default">Error: ${esc(err.message)}</div>`;
+    }
+}
+
+let _framesProgressTimer = null;
+
+function openIngestModal() {
+    // Reset state
+    document.getElementById("ingest-dir-input").value = "";
+    document.getElementById("ingest-preview-area").style.display = "none";
+    document.getElementById("ingest-preview-empty").style.display = "none";
+    document.getElementById("ingest-reprocess-all").checked = false;
+    document.getElementById("ingest-reprocess-warning").style.display = "none";
+    document.getElementById("ingest-start-error").style.display = "none";
+    document.getElementById("btn-ingest-start").disabled = true;
+    document.getElementById("ingest-overlay").style.display = "flex";
+    document.getElementById("ingest-dir-input").focus();
+    loadMissingFramesInfo();
+}
+
+function closeIngestModal() {
+    document.getElementById("ingest-overlay").style.display = "none";
+    if (_framesProgressTimer) { clearTimeout(_framesProgressTimer); _framesProgressTimer = null; }
+}
+
+async function loadMissingFramesInfo() {
+    try {
+        const resp = await fetch("/api/ingest/missing-frames");
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const status = document.getElementById("ingest-missing-status");
+        const fixBtn = document.getElementById("btn-fix-thumbnails");
+        const reextractBtn = document.getElementById("btn-reextract-all-thumbnails");
+
+        if (data.running) {
+            const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 0;
+            const modeLabel = data.mode === "all" ? "Regenerating all thumbnails" : "Extracting missing thumbnails";
+            status.textContent = `${modeLabel}… ${data.done} / ${data.total} clips`;
+            fixBtn.disabled = true;
+            reextractBtn.disabled = true;
+            document.getElementById("ingest-frames-progress").style.display = "block";
+            document.getElementById("ingest-frames-bar").style.width = pct + "%";
+            document.getElementById("ingest-frames-label").textContent = `${data.done} of ${data.total} done`;
+            _framesProgressTimer = setTimeout(loadMissingFramesInfo, 2000);
+        } else {
+            document.getElementById("ingest-frames-progress").style.display = "none";
+            reextractBtn.disabled = false;
+            reextractBtn.textContent = `Regenerate all (${data.total})`;
+            if (data.count > 0) {
+                status.textContent = `${data.count} of ${data.total} clip${data.total !== 1 ? "s" : ""} have no thumbnails`;
+                fixBtn.disabled = false;
+                fixBtn.textContent = `Extract missing (${data.count})`;
+            } else {
+                status.textContent = `All ${data.total} clips have thumbnails`;
+                fixBtn.disabled = true;
+                fixBtn.textContent = `Extract missing (0)`;
+            }
+        }
+    } catch (_) {}
+}
+
+async function onExtractFrames(force) {
+    document.getElementById("ingest-start-error").style.display = "none";
+    document.getElementById("btn-fix-thumbnails").disabled = true;
+    document.getElementById("btn-reextract-all-thumbnails").disabled = true;
+    try {
+        const resp = await fetch("/api/ingest/extract-missing-frames", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ force }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            document.getElementById("ingest-start-error").textContent = data.detail || "Failed to start";
+            document.getElementById("ingest-start-error").style.display = "block";
+            loadMissingFramesInfo();
+            return;
+        }
+        loadMissingFramesInfo();
+    } catch (err) {
+        document.getElementById("ingest-start-error").textContent = "Could not reach server: " + err.message;
+        document.getElementById("ingest-start-error").style.display = "block";
+        loadMissingFramesInfo();
+    }
+}
+
+async function onIngestPreview() {
+    const dir = document.getElementById("ingest-dir-input").value.trim();
+    if (!dir) return;
+
+    const btn = document.getElementById("btn-ingest-preview");
+    btn.disabled = true;
+    btn.textContent = "Loading…";
+    document.getElementById("ingest-start-error").style.display = "none";
+
+    try {
+        const resp = await fetch("/api/ingest/list-videos", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ directory: dir }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showIngestError(data.detail || "Failed to list videos");
+            document.getElementById("ingest-preview-area").style.display = "none";
+            document.getElementById("ingest-preview-empty").style.display = "none";
+            document.getElementById("btn-ingest-start").disabled = true;
+            return;
+        }
+        if (data.count === 0) {
+            document.getElementById("ingest-preview-area").style.display = "none";
+            document.getElementById("ingest-preview-empty").style.display = "block";
+            document.getElementById("btn-ingest-start").disabled = true;
+        } else {
+            document.getElementById("ingest-preview-count").textContent =
+                `${data.count} video file${data.count !== 1 ? "s" : ""} found`;
+            document.getElementById("ingest-preview-list").textContent = data.files.join("\n");
+            document.getElementById("ingest-preview-area").style.display = "block";
+            document.getElementById("ingest-preview-empty").style.display = "none";
+            document.getElementById("btn-ingest-start").disabled = false;
+        }
+    } catch (err) {
+        showIngestError("Could not reach server: " + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = "Preview";
+    }
+}
+
+function onReprocessAllToggle() {
+    const checked = document.getElementById("ingest-reprocess-all").checked;
+    const warning = document.getElementById("ingest-reprocess-warning");
+    if (checked) {
+        const count = allClips.length;
+        document.getElementById("ingest-reprocess-count").textContent =
+            `all ${count} clip${count !== 1 ? "s" : ""}`;
+        document.getElementById("ingest-reprocess-list").textContent =
+            allClips.map(c => c.filename).join("\n");
+        warning.style.display = "block";
+    } else {
+        warning.style.display = "none";
+    }
+}
+
+async function onIngestStart() {
+    const dir = document.getElementById("ingest-dir-input").value.trim();
+    const reprocessAll = document.getElementById("ingest-reprocess-all").checked;
+    const btn = document.getElementById("btn-ingest-start");
+
+    btn.disabled = true;
+    btn.textContent = "Starting…";
+    document.getElementById("ingest-start-error").style.display = "none";
+
+    try {
+        const resp = await fetch("/api/ingest/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ directory: dir, reprocess_all: reprocessAll }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showIngestError(data.detail || "Failed to start ingest");
+            btn.disabled = false;
+            btn.textContent = "Start Ingest";
+            return;
+        }
+        closeIngestModal();
+    } catch (err) {
+        showIngestError("Could not reach server: " + err.message);
+        btn.disabled = false;
+        btn.textContent = "Start Ingest";
+    }
+}
+
+function showIngestError(msg) {
+    const el = document.getElementById("ingest-start-error");
+    el.textContent = msg;
+    el.style.display = "block";
 }
 
 // ─── Utilities ────────────────────────────────────────────────────

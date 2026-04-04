@@ -394,6 +394,9 @@ def regenerate_tags(clip_id: int, _auth=Depends(require_auth)):
         clip["filename"],
     )
 
+    if not auto_tags:
+        return {"error": "Tag generation failed — check that Ollama is running and the text model is available"}
+
     # Merge with any existing user tags
     existing = [t.strip() for t in (clip.get("tags") or "").split(",") if t.strip()]
     merged = list(dict.fromkeys(existing + auto_tags))

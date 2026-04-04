@@ -10,9 +10,7 @@ from pathlib import Path
 from vanal.extractor import extract_audio
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
-# Lower threshold = less aggressive filtering of uncertain speech segments.
-# Default is 0.6; 0.3 catches quieter / noisier audio.
-NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.3"))
+NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.6"))
 
 
 def transcribe_audio(video_path: str | Path) -> str | None:

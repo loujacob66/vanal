@@ -100,6 +100,10 @@
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                     Outputs
                 </button>
+                <button id="btn-ingest" class="btn">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    Ingest Videos
+                </button>
                 <button id="btn-logout" class="btn" style="display:none;color:var(--text2)">Sign Out</button>
             </div>
         </aside>
@@ -262,6 +266,71 @@
         </div>
     </div>
 
-    <script src="/app.js?v=13"></script>
+    <!-- Folder picker modal -->
+    <div id="folder-picker-overlay" class="modal-overlay" style="display:none;z-index:200">
+        <div class="modal" style="max-width:480px">
+            <button class="modal-close" id="folder-picker-close">&times;</button>
+            <h2 style="margin-bottom:10px">Choose Folder</h2>
+            <div id="folder-picker-path" class="folder-picker-path"></div>
+            <div id="folder-picker-list" class="folder-picker-list"></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+                <button id="btn-folder-picker-cancel" class="btn">Cancel</button>
+                <button id="btn-folder-picker-select" class="btn btn-primary">Select This Folder</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Ingest modal -->
+    <div id="ingest-overlay" class="modal-overlay" style="display:none;">
+        <div class="modal">
+            <button class="modal-close" id="ingest-close">&times;</button>
+            <h2 style="margin-bottom:16px">Ingest Videos</h2>
+            <div id="ingest-missing-section" style="margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid var(--border)">
+                <div style="font-size:0.72rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text2);margin-bottom:8px">Thumbnails</div>
+                <div id="ingest-missing-status" style="font-size:0.85rem;color:var(--text2);margin-bottom:10px">Checking…</div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                    <button id="btn-fix-thumbnails" class="btn btn-sm" disabled title="Extract frames only for clips that have none at all">Extract missing</button>
+                    <button id="btn-reextract-all-thumbnails" class="btn btn-sm" disabled title="Delete and re-extract frames for every clip — use this if thumbnails are black or wrong">Regenerate all</button>
+                </div>
+                <div id="ingest-frames-progress" style="display:none;margin-top:10px">
+                    <div id="ingest-frames-label" style="font-size:0.78rem;color:var(--text2);margin-bottom:4px"></div>
+                    <div class="progress-track"><div id="ingest-frames-bar" class="progress-bar"></div></div>
+                </div>
+            </div>
+            <div class="field">
+                <label>Video directory</label>
+                <div style="display:flex;gap:8px">
+                    <input type="text" id="ingest-dir-input" placeholder="/path/to/videos" style="flex:1">
+                    <button id="btn-folder-browse" class="btn btn-sm">Browse</button>
+                    <button id="btn-ingest-preview" class="btn btn-sm">Preview</button>
+                </div>
+            </div>
+            <div id="ingest-preview-area" style="display:none;margin-bottom:14px">
+                <div id="ingest-preview-count" style="font-size:0.8rem;color:var(--text2);margin-bottom:6px"></div>
+                <div id="ingest-preview-list" class="ingest-file-list"></div>
+            </div>
+            <div id="ingest-preview-empty" style="display:none;font-size:0.85rem;color:var(--text2);margin-bottom:14px">
+                No video files found in that directory.
+            </div>
+            <div class="field checkbox-field" style="margin-bottom:0">
+                <input type="checkbox" id="ingest-reprocess-all">
+                <label for="ingest-reprocess-all">Re-analyze all clips (including already-done)</label>
+            </div>
+            <div id="ingest-reprocess-warning" style="display:none;margin-top:12px">
+                <div class="ingest-warning">
+                    <strong>Warning:</strong> This will re-analyze <span id="ingest-reprocess-count"></span> clips already in your library — not just the selected folder. Each clip runs full AI analysis again. This can take a very long time.
+                </div>
+                <div style="font-size:0.78rem;color:var(--text2);margin:8px 0 4px">Clips that will be re-analyzed:</div>
+                <div id="ingest-reprocess-list" class="ingest-file-list"></div>
+            </div>
+            <div id="ingest-start-error" style="display:none;color:var(--red);font-size:0.85rem;margin-top:10px"></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+                <button id="btn-ingest-modal-cancel" class="btn">Cancel</button>
+                <button id="btn-ingest-start" class="btn btn-primary" disabled>Start Ingest</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js?v=17"></script>
 </body>
 </html>

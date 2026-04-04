@@ -94,15 +94,24 @@ def extract_frames(
             raise RuntimeError(f"ffmpeg frame extraction failed for {path}: {result.stderr.strip()}")
         return [out_path] if out_path.exists() else []
 
-    # Use select filter to pick evenly spaced frames
-    # fps=N/duration selects N frames evenly across the video
-    fps_filter = f"fps={n_frames}/{duration},scale={frame_width}:-1"
+    # Sample from the center of each equal interval so frame_0001 is never
+    # at t=0 (which is black for fade-in videos).
+    step = duration / n_frames
+    start = step * 0.5  # first sample at midpoint of first interval
+    trimmed = duration - start
+
+    vf = (
+        f"trim=start={start:.3f},"
+        f"setpts=PTS-STARTPTS,"
+        f"fps={n_frames}/{trimmed:.3f},"
+        f"scale={frame_width}:-1"
+    )
     out_pattern = str(output_dir / "frame_%04d.jpg")
 
     cmd = [
         "ffmpeg", "-y",
         "-i", str(path),
-        "-vf", fps_filter,
+        "-vf", vf,
         "-q:v", "3",
         out_pattern,
     ]
