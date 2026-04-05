@@ -51,9 +51,9 @@ def _describe_single_frame(frame_path: Path, index: int, total: int, filename: s
     """Describe a single frame using the vision model. Returns a text description."""
     image_b64 = _encode_image(frame_path)
     prompt = (
-        f"This is frame {index + 1} of {total} from a short AI-generated video clip "
-        f"named '{filename}'. These clips are AI-generated and may show food, people, "
-        f"places, products, or abstract visuals. "
+        f"This is frame {index + 1} of {total} from a short video clip "
+        f"named '{filename}'. The video may be real footage or AI-generated, and may "
+        f"show food, people, places, products, or abstract visuals. "
         f"Describe what you see accurately in one concise sentence. "
         f"If you see food or a decorated cake, say so — do not describe food items as urns or vases."
     )
@@ -101,7 +101,7 @@ def describe_frames(frame_paths: list[Path], filename: str, transcript: str | No
 
     synopsis_prompt = (
         f"These are descriptions of {len(frame_descriptions)} frames from a short "
-        f"AI-generated video clip named '{filename}':\n\n"
+        f"video clip named '{filename}':\n\n"
         f"{descriptions_text}"
         f"{transcript_section}\n\n"
         "Using both the visual descriptions and the transcript (if provided), write a "
@@ -192,7 +192,7 @@ def suggest_ordering(clips: list[dict]) -> list[dict]:
     )
 
     prompt = (
-        "You are helping arrange a video reel of short AI-generated clips into a "
+        "You are helping arrange a video reel of short clips into a "
         "compelling narrative sequence.\n\n"
         "Here are all the clips with their IDs and descriptions:\n\n"
         f"{clip_lines}\n\n"
