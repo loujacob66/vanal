@@ -25,13 +25,21 @@ def _owner_where(user: dict) -> tuple[str, list]:
     return " AND owner_id = ?", [user["id"]]
 
 
-def get_user_clip(conn, clip_id: int, user: dict, columns: str = "*") -> dict:
-    """Fetch a clip and verify ownership.  Admin can access any clip.  Raises 404/403."""
+def get_user_clip(conn, clip_id: int, user: dict, columns: str = "*", allow_shared: bool = False) -> dict:
+    """Fetch a clip and verify ownership.  Admin can access any clip.  Raises 404/403.
+    If allow_shared=True, also grants read access to users the clip was shared with."""
     row = conn.execute(f"SELECT {columns} FROM clips WHERE id = ?", (clip_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Clip not found")
     clip = dict(row)
     if not user["is_admin"] and clip.get("owner_id") != user["id"]:
+        if allow_shared:
+            shared = conn.execute(
+                "SELECT 1 FROM clip_shares WHERE clip_id = ? AND shared_with = ?",
+                (clip_id, user["id"]),
+            ).fetchone()
+            if shared:
+                return clip
         raise HTTPException(status_code=403, detail="Access denied")
     return clip
 
@@ -155,11 +163,80 @@ def list_clips(
         return [_row_to_dict(r) for r in rows]
 
 
+# ── Notifications ─────────────────────────────────────────────────
+
+@router.get("/notifications")
+def list_notifications(_auth=Depends(require_auth)):
+    """Return unread + recent notifications for current user."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT n.*, c.filename, c.title, m.filename AS montage_filename
+               FROM notifications n
+               LEFT JOIN clips c ON n.clip_id = c.id
+               LEFT JOIN montages m ON n.montage_id = m.id
+               WHERE n.user_id = ?
+               ORDER BY n.created_at DESC LIMIT 50""",
+            (_auth["id"],),
+        ).fetchall()
+        unread = sum(1 for r in rows if not r["is_read"])
+    return {"notifications": [dict(r) for r in rows], "unread_count": unread}
+
+
+@router.post("/notifications/read")
+def mark_notifications_read(_auth=Depends(require_auth)):
+    """Mark all notifications as read for current user."""
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
+            (_auth["id"],),
+        )
+    return {"ok": True}
+
+
+@router.post("/notifications/{notif_id}/read")
+def mark_one_read(notif_id: int, _auth=Depends(require_auth)):
+    """Mark a single notification as read."""
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?",
+            (notif_id, _auth["id"]),
+        )
+    return {"ok": True}
+
+
+@router.get("/clips/shareable-users")
+def list_shareable_users(_auth=Depends(require_auth)):
+    """List all users except the current one, for sharing UI."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, email FROM users WHERE id != ? ORDER BY name, email",
+            (_auth["id"],),
+        ).fetchall()
+    return [{"id": r["id"], "name": r["name"], "email": r["email"]} for r in rows]
+
+
+@router.get("/clips/shared-with-me")
+def shared_with_me(_auth=Depends(require_auth)):
+    """Return clips that have been shared with the current user."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT c.*, u.name AS owner_name, u.email AS owner_email,
+                      cs.created_at AS shared_at
+               FROM clip_shares cs
+               JOIN clips c ON cs.clip_id = c.id
+               LEFT JOIN users u ON c.owner_id = u.id
+               WHERE cs.shared_with = ? AND c.status = 'done'
+               ORDER BY cs.created_at DESC""",
+            (_auth["id"],),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+
 @router.get("/clips/{clip_id}/video")
 def stream_clip(clip_id: int, request: Request, _auth=Depends(require_auth)):
     """Stream the original video file for in-browser playback."""
     with db.get_conn() as conn:
-        clip = get_user_clip(conn, clip_id, _auth, columns="filepath")
+        clip = get_user_clip(conn, clip_id, _auth, columns="filepath, owner_id", allow_shared=True)
 
     path = Path(clip["filepath"])
     if not path.exists():
@@ -178,7 +255,7 @@ def stream_clip(clip_id: int, request: Request, _auth=Depends(require_auth)):
 @router.get("/clips/{clip_id}")
 def get_clip(clip_id: int, _auth=Depends(require_auth)):
     with db.get_conn() as conn:
-        clip = get_user_clip(conn, clip_id, _auth)
+        clip = get_user_clip(conn, clip_id, _auth, allow_shared=True)
         return _row_to_dict(clip)
 
 
@@ -187,6 +264,7 @@ class ClipUpdate(BaseModel):
     tags: str | None = None
     notes: str | None = None
     transcript: str | None = None
+    title: str | None = None
 
 
 @router.patch("/clips/{clip_id}")
@@ -208,6 +286,9 @@ def update_clip(clip_id: int, update: ClipUpdate, _auth=Depends(require_auth)):
         if update.notes is not None:
             fields.append("notes = ?")
             values.append(update.notes)
+        if update.title is not None:
+            fields.append("title = ?")
+            values.append(update.title if update.title.strip() else None)
 
         if fields:
             fields.append("updated_at = datetime('now')")
@@ -323,6 +404,85 @@ def regenerate_synopsis(clip_id: int, _auth=Depends(require_auth)):
     return {"ok": True, "synopsis": synopsis}
 
 
+@router.post("/clips/{clip_id}/suggest-title")
+def suggest_title(clip_id: int, _auth=Depends(require_auth)):
+    """Suggest a descriptive title for a clip based on its synopsis and filename."""
+    with db.get_conn() as conn:
+        clip = get_user_clip(conn, clip_id, _auth)
+
+    synopsis = clip.get("synopsis") or ""
+    if not synopsis:
+        return {"error": "No synopsis available — process or regenerate synopsis first"}
+
+    from vanal.vision import _ollama_generate, TEXT_MODEL
+
+    prompt = (
+        f"A video clip is currently named '{clip['filename']}'. "
+        f"Here is its synopsis:\n\n{synopsis}\n\n"
+        f"Suggest a short, descriptive title for this clip (3-8 words). "
+        f"The title should capture the essence of what the clip is about. "
+        f"Do NOT include a file extension. "
+        f"Respond with ONLY the title, nothing else."
+    )
+
+    title = _ollama_generate(TEXT_MODEL, prompt).strip().strip('"').strip("'")
+    return {"ok": True, "title": title}
+
+
+# ── Clip sharing ──────────────────────────────────────────────────
+
+class ShareRequest(BaseModel):
+    user_ids: list[int]
+
+
+@router.post("/clips/{clip_id}/share")
+def share_clip(clip_id: int, req: ShareRequest, _auth=Depends(require_auth)):
+    """Share a clip with one or more users."""
+    with db.get_conn() as conn:
+        clip = get_user_clip(conn, clip_id, _auth, columns="id, owner_id, filename, title")
+        clip_name = clip.get("title") or clip["filename"]
+        sharer_name = _auth.get("name") or _auth.get("email", "Someone")
+        for uid in req.user_ids:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO clip_shares (clip_id, shared_by, shared_with) VALUES (?, ?, ?)",
+                (clip_id, _auth["id"], uid),
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    "INSERT INTO notifications (user_id, type, message, clip_id) VALUES (?, ?, ?, ?)",
+                    (uid, "share", f"{sharer_name} shared \"{clip_name}\" with you", clip_id),
+                )
+    return {"ok": True}
+
+
+@router.delete("/clips/{clip_id}/share/{user_id}")
+def unshare_clip(clip_id: int, user_id: int, _auth=Depends(require_auth)):
+    """Remove a share from a specific user."""
+    with db.get_conn() as conn:
+        get_user_clip(conn, clip_id, _auth, columns="id, owner_id")
+        conn.execute(
+            "DELETE FROM clip_shares WHERE clip_id = ? AND shared_with = ?",
+            (clip_id, user_id),
+        )
+    return {"ok": True}
+
+
+@router.get("/clips/{clip_id}/shares")
+def list_clip_shares(clip_id: int, _auth=Depends(require_auth)):
+    """List users a clip is shared with."""
+    with db.get_conn() as conn:
+        get_user_clip(conn, clip_id, _auth, columns="id, owner_id")
+        rows = conn.execute(
+            """SELECT cs.shared_with AS user_id, u.name, u.email, cs.created_at
+               FROM clip_shares cs
+               JOIN users u ON cs.shared_with = u.id
+               WHERE cs.clip_id = ?
+               ORDER BY u.name, u.email""",
+            (clip_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 @router.post("/clips/{clip_id}/extract-frames")
 def extract_clip_frames(clip_id: int, _auth=Depends(require_auth)):
     """Re-extract frames for a clip that's missing them."""
@@ -358,7 +518,7 @@ def extract_clip_frames(clip_id: int, _auth=Depends(require_auth)):
 def list_clip_frames(clip_id: int, _auth=Depends(require_auth)):
     """Return sorted list of extracted frame filenames available for this clip."""
     with db.get_conn() as conn:
-        clip = get_user_clip(conn, clip_id, _auth, columns="id, file_hash, thumbnail_frame, owner_id")
+        clip = get_user_clip(conn, clip_id, _auth, columns="id, file_hash, thumbnail_frame, owner_id", allow_shared=True)
 
     frames_dir = Path(os.getenv("FRAMES_DIR", "frames")) / clip["file_hash"]
     if not frames_dir.exists():
@@ -529,10 +689,23 @@ async def upload_clip(file: UploadFile = File(...), _auth=Depends(require_auth))
     dest.write_bytes(contents)
 
     # Create pending DB row immediately so it shows in the queue
-    from vanal.ingest import sha256_file, _upsert_pending
+    from vanal.ingest import sha256_file
     file_hash = sha256_file(dest)
     with db.get_conn() as conn:
-        _upsert_pending(conn, dest.name, str(dest.resolve()), file_hash, owner_id=_auth["id"])
+        # Check if this user already has this exact file
+        existing = conn.execute(
+            "SELECT id FROM clips WHERE file_hash = ? AND owner_id = ?",
+            (file_hash, _auth["id"]),
+        ).fetchone()
+        if existing:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(status_code=409, detail="You already have this video")
+
+        # Create clip — same video can exist for different owners
+        cursor = conn.execute(
+            "INSERT INTO clips (filename, filepath, file_hash, status, owner_id) VALUES (?, ?, ?, 'pending', ?)",
+            (dest.name, str(dest.resolve()), file_hash, _auth["id"]),
+        )
 
     # Kick the background worker to pick it up
     _kick_processing_worker()

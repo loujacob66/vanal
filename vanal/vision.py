@@ -208,6 +208,12 @@ def suggest_ordering(clips: list[dict]) -> list[dict]:
         try:
             response_text = _ollama_generate(TEXT_MODEL, prompt, json_mode=True)
             result = _parse_json_response(response_text)
+            if isinstance(result, dict):
+                # Ollama often wraps arrays: {"clips": [...]} or {"ordering": [...]}
+                for v in result.values():
+                    if isinstance(v, list):
+                        result = v
+                        break
             if not isinstance(result, list):
                 raise ValueError("Expected a JSON array")
             return result

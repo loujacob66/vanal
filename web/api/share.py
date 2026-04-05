@@ -1,5 +1,7 @@
+from pathlib import Path
+
 from fastapi import APIRouter, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from vanal import db
 
@@ -19,6 +21,7 @@ def share_clip(clip_id: int):
 
     clip = dict(row)
     filename   = clip.get("filename", "")
+    title      = clip.get("title") or filename
     synopsis   = clip.get("synopsis") or ""
     transcript = clip.get("transcript") or ""
     duration   = clip.get("duration") or 0
@@ -46,8 +49,8 @@ def share_clip(clip_id: int):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{_esc(filename)} — vanal</title>
-    <meta property="og:title" content="{_esc(filename)}">
+    <title>{_esc(title)} — vanal</title>
+    <meta property="og:title" content="{_esc(title)}">
     <meta property="og:description" content="{_esc(synopsis[:200]) if synopsis else ''}">
     <meta property="og:type" content="video.other">
     {_common_styles()}
@@ -56,7 +59,8 @@ def share_clip(clip_id: int):
     <div class="card">
         <div class="brand"><a href="/">vanal</a></div>
         <video controls preload="metadata" src="/api/clips/{clip_id}/video"></video>
-        <h1>{_esc(filename)}</h1>
+        <h1>{_esc(title)}</h1>
+        {f'<div class="meta" style="margin-bottom:4px">{_esc(filename)}</div>' if title != filename else ''}
         <div class="meta">{meta_html}</div>
         {synopsis_block}
         {transcript_block}
@@ -102,6 +106,7 @@ def share_playlist(ids: str = Query(default="")):
     def clip_block(c: dict, idx: int) -> str:
         cid       = c["id"]
         filename  = c.get("filename", "")
+        title     = c.get("title") or filename
         synopsis  = c.get("synopsis") or ""
         transcript= c.get("transcript") or ""
         duration  = c.get("duration") or 0
@@ -121,7 +126,7 @@ def share_playlist(ids: str = Query(default="")):
         <div class="pl-item" id="clip-{cid}">
             <div class="pl-num">{idx + 1}</div>
             <div class="pl-body">
-                <div class="pl-title">{_esc(filename)}</div>
+                <div class="pl-title">{_esc(title)}</div>
                 <div class="meta" style="margin-bottom:10px">{meta_html}</div>
                 <video controls preload="metadata" src="/api/clips/{cid}/video"></video>
                 {f'<div class="pl-details">{synopsis_html}{transcript_html}</div>' if (synopsis or transcript) else ""}
@@ -196,6 +201,115 @@ def share_playlist(ids: str = Query(default="")):
 </html>"""
 
     return HTMLResponse(html)
+
+
+# ─── Montage share ────────────────────────────────────────────────
+
+@router.get("/montage/{montage_id}", response_class=HTMLResponse)
+def share_montage(montage_id: int):
+    """Standalone read-only share page for a montage."""
+    with db.get_conn() as conn:
+        montage = conn.execute(
+            "SELECT m.*, u.name AS owner_name FROM montages m LEFT JOIN users u ON m.owner_id = u.id WHERE m.id = ?",
+            (montage_id,),
+        ).fetchone()
+
+    if not montage:
+        return HTMLResponse("<h2>Montage not found</h2>", status_code=404)
+
+    m = dict(montage)
+    filename = m.get("filename", "")
+    display_name = filename.replace("_", " ").rsplit(".", 1)[0]
+    # Strip timestamp suffix
+    import re
+    display_name = re.sub(r'\s+\d{8}\s+\d{6}$', '', display_name)
+    owner = m.get("owner_name") or "Unknown"
+    size_mb = m.get("size_mb") or 0
+    created = m.get("created_at") or ""
+
+    # Get clip thumbnails for poster display
+    with db.get_conn() as conn:
+        clip_rows = conn.execute(
+            """SELECT c.file_hash, c.thumbnail_frame, c.filename, c.title
+               FROM montage_clips mc
+               JOIN clips c ON mc.clip_id = c.id
+               WHERE mc.montage_id = ?
+               ORDER BY mc.position""",
+            (montage_id,),
+        ).fetchall()
+
+    clip_list_html = ""
+    if clip_rows:
+        items = []
+        for i, c in enumerate(clip_rows):
+            thumb = f"/frames/{c['file_hash']}/{c['thumbnail_frame'] or 'frame_0001.jpg'}"
+            name = _esc(c["title"] or c["filename"])
+            items.append(f'<div class="mc-item"><img src="{thumb}" onerror="this.style.display=\'none\'"><span>{i+1}. {name}</span></div>')
+        clip_list_html = f"""
+        <div class="section">
+            <div class="label">Clips in this montage ({len(clip_rows)})</div>
+            <div class="mc-grid">{"".join(items)}</div>
+        </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{_esc(display_name)} — vanal</title>
+    <meta property="og:title" content="{_esc(display_name)}">
+    <meta property="og:description" content="Montage by {_esc(owner)} · {len(clip_rows)} clips · {size_mb} MB">
+    <meta property="og:type" content="video.other">
+    {_common_styles()}
+    <style>
+        .mc-grid {{
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            gap: 8px; margin-top: 8px;
+        }}
+        .mc-item {{
+            display: flex; flex-direction: column; gap: 4px;
+            background: #161825; border-radius: 8px; overflow: hidden;
+        }}
+        .mc-item img {{
+            width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block;
+        }}
+        .mc-item span {{
+            padding: 4px 8px 6px; font-size: 0.72rem; color: #8b8fa3;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="brand"><a href="/">vanal</a></div>
+        <video controls preload="metadata" src="/share/montage/{montage_id}/video"></video>
+        <h1>{_esc(display_name)}</h1>
+        <div class="meta">By {_esc(owner)} · {size_mb} MB · {_esc(created)}</div>
+        {clip_list_html}
+        <a class="back" href="/">← Back to library</a>
+    </div>
+</body>
+</html>"""
+
+    return HTMLResponse(html)
+
+
+@router.get("/montage/{montage_id}/video")
+def share_montage_video(montage_id: int):
+    """Stream montage video for the public share page (no auth)."""
+    with db.get_conn() as conn:
+        montage = conn.execute(
+            "SELECT filepath, filename FROM montages WHERE id = ?", (montage_id,)
+        ).fetchone()
+
+    if not montage:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    path = Path(montage["filepath"])
+    if not path.exists():
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    return FileResponse(path, media_type="video/mp4", filename=montage["filename"])
 
 
 # ─── Helpers ──────────────────────────────────────────────────────

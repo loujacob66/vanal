@@ -1,6 +1,7 @@
 import json
 
 from fastapi import APIRouter, Body, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from vanal import db
 from vanal.vision import suggest_ordering
@@ -40,7 +41,17 @@ def ai_suggest_order(req: SuggestRequest = Body(default_factory=SuggestRequest),
         return {"error": "No processed clips found"}
 
     clips = [{"id": r["id"], "filename": r["filename"], "synopsis": r["synopsis"]} for r in rows]
-    suggestion = suggest_ordering(clips)
+
+    if len(clips) > 50:
+        return JSONResponse(
+            {"error": f"Too many clips ({len(clips)}) for AI ordering. Select up to 50 clips in the Queue and use 'AI Order Queue' instead."},
+            status_code=400,
+        )
+
+    try:
+        suggestion = suggest_ordering(clips)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
     # Store the suggestion with owner_id
     with db.get_conn() as conn:

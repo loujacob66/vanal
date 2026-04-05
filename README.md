@@ -4,9 +4,10 @@ A local-first tool for ingesting, analyzing, and curating short video clips. Poi
 
 - Extract key frames and generate per-clip synopses and tags using a local vision LLM (via [Ollama](https://ollama.ai))
 - Store everything in a local SQLite database with full-text search
-- Serve a web UI for browsing, searching, tagging, and reordering clips
+- Serve a multi-user web UI for browsing, searching, tagging, and reordering clips
 - Suggest narrative clip orderings using an LLM
-- Render montages (concatenated clip sequences) via FFmpeg
+- Render montages (concatenated clip sequences) via FFmpeg, with mixed aspect ratio support
+- Share clips and montages between users, with notifications and public share links
 - Download all videos from one or more [Sora](https://sora.com) accounts (`sora_download.py`)
 
 All AI inference runs **locally** through Ollama — no cloud API required for ingestion or the web UI.
@@ -96,6 +97,9 @@ OUTPUT_DIR=./outputs
 #   OUTPUT_DIR=/mnt/nas/videos/exports
 #   OUTPUT_DIR=/Volumes/Media/vanal-outputs
 
+# Upload directory for user-uploaded videos (stored as {UPLOAD_DIR}/{user_id}/)
+UPLOAD_DIR=./uploads
+
 # Frame extraction
 MAX_FRAMES_PER_CLIP=3        # frames to sample per video
 FRAME_WIDTH=256              # JPEG width (height scales proportionally)
@@ -107,9 +111,16 @@ INGEST_DELAY_SECS=1.0
 ENABLE_TRANSCRIPTION=false
 WHISPER_MODEL=base           # tiny | base | small | medium | large
 
-# Web UI password — leave blank to disable auth (fine for local use)
-# Set a value if you expose the server on a network
-WEB_PASSWORD=
+# Google OAuth (required for multi-user auth)
+# Create at console.cloud.google.com -> Credentials -> OAuth 2.0 Client ID
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REDIRECT_URI=http://localhost:8000/api/auth/google/callback
+SECRET_KEY=                  # generate with: python -c "import secrets; print(secrets.token_hex(32))"
+ADMIN_EMAIL=                 # first admin user's Google email
+
+# In-app tutorial prefix (shown on help guide titles)
+FTM_PREFIX=If you are stupid...
 
 # Sora downloader
 # SORA_API_KEYS=sk-key1:AccountA,sk-key2:AccountB
@@ -152,7 +163,7 @@ python run.py serve
 
 Options:
 ```
---host 0.0.0.0    # bind to all interfaces (set WEB_PASSWORD if you do this)
+--host 0.0.0.0    # bind to all interfaces
 --port 8080
 --reload          # auto-reload on code changes (development)
 ```
@@ -188,11 +199,16 @@ python sora_download.py --output /path/to/sora_downloads
 ## Web UI Features
 
 - **Browse & search** — full-text search across synopses, tags, transcripts, and filenames
-- **Tag management** — view and filter by auto-generated or manual tags
-- **Notes** — add free-form notes to any clip
-- **AI ordering** — ask the LLM to suggest a narrative sequence for selected clips
-- **Export** — export clip list as JSON or an FFmpeg concat script
-- **Render montage** — concatenate selected clips into a single output file via FFmpeg
+- **Tag management** — filter by auto-generated tags; multi-tag OR filtering
+- **Upload** — drag-and-drop or button upload with automatic processing pipeline
+- **AI ordering** — ask the LLM to suggest a narrative sequence for your library or queued clips (max 50)
+- **Queue & montage** — select clips into a queue, reorder via drag-and-drop, render montages via FFmpeg
+- **Mixed aspect ratios** — choose a canvas size (landscape, portrait, square) and fit mode (letterbox or crop) when clips have different dimensions
+- **Sharing** — share individual clips or rendered montages with other users; notification system with badges
+- **Public share links** — generate unauthenticated URLs for clips, playlists, and montages
+- **Admin tools** — view-as-user impersonation, owner filter, folder ingest from server paths, batch re-tag and synopsis regeneration
+- **In-app tutorials** — configurable help guides (FTM system) with auto-show on first visit
+- **Multi-user auth** — Google OAuth with per-user content isolation
 
 ---
 
@@ -206,15 +222,20 @@ vanal/
 ├── .env.example        # Configuration template — copy to .env
 ├── vanal/              # Core library
 │   ├── ingest.py       # Ingestion pipeline
-│   ├── db.py           # SQLite schema and queries
-│   ├── vision.py       # Ollama frame analysis
+│   ├── db.py           # SQLite schema, migrations, and queries
+│   ├── vision.py       # Ollama frame analysis & AI ordering
 │   ├── extractor.py    # FFmpeg frame/audio extraction
 │   ├── transcribe.py   # Whisper transcription (optional)
-│   └── auth.py         # Simple password authentication
+│   └── auth.py         # Session token creation & verification
 ├── web/                # FastAPI web application
-│   ├── app.py
-│   ├── static/         # Frontend (HTML + vanilla JS)
+│   ├── app.py          # App setup, middleware, static files
+│   ├── static/         # Frontend (HTML + vanilla JS + CSS)
 │   └── api/            # REST endpoints
+│       ├── auth.py     # Google OAuth, login/logout, admin impersonation
+│       ├── clips.py    # Clip CRUD, search, tags, notifications
+│       ├── export.py   # Montage rendering, outputs, montage sharing
+│       ├── ordering.py # AI ordering suggestions
+│       └── share.py    # Public share pages (clips, playlists, montages)
 ├── data/               # SQLite database (gitignored)
 ├── frames/             # Extracted frame cache (gitignored)
 └── outputs/            # Rendered montages (gitignored)

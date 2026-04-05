@@ -25,17 +25,29 @@ def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def _get_existing(conn, file_hash: str) -> dict | None:
-    row = conn.execute(
-        "SELECT id, status FROM clips WHERE file_hash = ?", (file_hash,)
-    ).fetchone()
+def _get_existing(conn, file_hash: str, owner_id: int | None = None) -> dict | None:
+    if owner_id is not None:
+        row = conn.execute(
+            "SELECT id, status FROM clips WHERE file_hash = ? AND owner_id = ?",
+            (file_hash, owner_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, status FROM clips WHERE file_hash = ?", (file_hash,)
+        ).fetchone()
     return dict(row) if row else None
 
 
 def _upsert_pending(conn, filename: str, filepath: str, file_hash: str, owner_id: int | None = None) -> int:
-    existing = conn.execute(
-        "SELECT id FROM clips WHERE file_hash = ?", (file_hash,)
-    ).fetchone()
+    if owner_id is not None:
+        existing = conn.execute(
+            "SELECT id FROM clips WHERE file_hash = ? AND owner_id = ?",
+            (file_hash, owner_id),
+        ).fetchone()
+    else:
+        existing = conn.execute(
+            "SELECT id FROM clips WHERE file_hash = ?", (file_hash,)
+        ).fetchone()
     if existing:
         conn.execute(
             "UPDATE clips SET filepath = ?, filename = ?, updated_at = datetime('now') WHERE id = ?",
@@ -78,7 +90,7 @@ def process_file(
     file_hash = sha256_file(path)
 
     with db.get_conn() as conn:
-        existing = _get_existing(conn, file_hash)
+        existing = _get_existing(conn, file_hash, owner_id)
 
         if existing:
             if existing["status"] == "done" and not reprocess_all:

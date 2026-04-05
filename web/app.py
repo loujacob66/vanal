@@ -10,12 +10,24 @@ except ImportError:
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+
+class NoCacheHTMLMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        ct = response.headers.get("content-type", "")
+        if "text/html" in ct:
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
 
 from vanal import db
 from web.api import auth, clips, ordering, export, share, ingest
 
 app = FastAPI(title="vanal", description="Video Analyzer & Reel Arranger")
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY", "dev-secret-change-me"))
+app.add_middleware(NoCacheHTMLMiddleware)
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(clips.router, prefix="/api")
